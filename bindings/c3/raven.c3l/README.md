@@ -39,10 +39,10 @@ python tools/bindgen/gen_c3.py -o some/dir      # writes somewhere else
 
 It writes two files into `src/`:
 
-- `raven_c.c3` (`raven::c`) - the whole C API as it is in the headers, a fallback for anything `raven` does not cover. It stands on its own (it does not import `raven`) and has the types and constants of C: `Rid`, `RWidgetType`, `RRect`, `R_INVALID_ID`, `R_WIDGET_BUTTON`... An enumeration is a `CInt` and texts are `char*`. Every function is an `extern fn` bound to the C function by `@cname`, under its C name except where C3 forbids it: a function cannot start with a capital, so `Rinit` is `raven::c::r_init` and `Rbutton_set_text` is `raven::c::r_button_set_text`.
+- `raven_c.c3` (`raven::c`) - the whole C API as it is in the headers, 1:1, a fallback for anything `raven` does not cover. It stands on its own (it does not import `raven`) and has the types and constants of C: `Rid`, `RWidgetType`, `RRect`, `R_INVALID_ID`, `R_WIDGET_BUTTON`, `R_COLOR_COUNT`, the end marks (`R_WIDGET_LAST_`)... An enumeration is a `CInt` and texts are `char*`. Every function is an `extern fn` bound to the C function by `@cname`, under its C name in snake_case, since a C3 function cannot start with a capital: `Rinit` is `raven::c::r_init` and `Rbutton_set_text` is `raven::c::r_button_set_text`. The macros are C3 macros (`R_ID_INDEX` is `r_id_index`, `Rerror_check()` is `r_error_check()`), and the function pointers of structures (`RBackendVTable`, `RAllocator`, `RHostPlatformDesc`) have their own types. It covers every header of `Raven.h`, `raven_vulkan.h` and `raven_backend.h` included, and `raven_web.h` (web views are part of the same library). It leaves out only `raven_emscripten.h`, which exists only in the WebAssembly build.
 - `raven.c3` (`raven`) - the C3 API described below, written over `raven::c`.
 
-Both files carry the documentation comments of the C headers as `<* ... *>`. Only the text is kept, with no `@param` lines and nothing C3 would read as a contract.
+Both files carry the documentation comments of the C headers as `<* ... *>`. Only the description is kept, with no `@param` lines and nothing C3 would read as a contract.
 
 `../tests/` has the first program of the guide written with each module, both in code and loaded from XML. See `../tests/README.md`.
 
@@ -54,8 +54,13 @@ The only additional thing you need to do is update the dynamic libraries for lin
 - **Constructors are functions:** `raven::button_create("OK")` returns a `Button`, and `raven::vbox_create()` returns a `Panel`.
 - **Errors are faults:** `RError` maps to `ERROR_INVALID_ID`, `ERROR_XML`, ... What can fail returns an Optional carrying the fault from `Rerror_get_last` (`ERROR_FAILED` when nothing was recorded): `raven::init(...)`, `window.set_theme(...)`, `raven::font_create_from_file(...)`, `raven::window_create_from_xml(...)`, and others. `raven::check()!;` raises any pending error.
 - **Yes/no values are `bool`:** functions that answer yes or no return `bool`, and parameters like `enabled` or `visible` take one.
+- **Slices:** a pointer and its count are one slice: `plot.set_series_data(0, xs, ys)`, `raven::tr_format("key", args)`, `browser.set_filters(filters)`, `raven::shader_create(spirv_bytes, flags)`. XML given as text is a `String`: `raven::window_create_from_xml(xml)`.
+- **Results instead of out-pointers:** what C fills through pointers is returned. Several numbers are a vector: `window.get_size()` is a `CInt[<2>]`, `widget.get_rect()` a `float[<4>]` (`{ x, y, width, height }`), `color_picker.get_color()` a `float[<4>]`. A structure is returned by value: `raven::memory_get_stats()`, `window.get_frame_stats()`, or as an Optional when C can fail: `window.get_native_handle()!`.
+- **Struct methods:** the functions of a structure are its methods: `spring.kick(2.0)`, `look.init()`. Handles also have `.is_valid()` and `.index()`.
+- **Memory:** memory Raven gives to the application is released the C3 way. `raven::file_read(path)` returns a `char[]` copied with an `Allocator` (`mem` by default, or `tmem`, or any other) and frees Raven's buffer. `window.capture()` and `raven::image_decode(bytes)` return `Pixels`, released with `pixels.free()` (`defer pixels.free();`).
 - **Enums are `constset`s** with the C values. Flag sets combine with `|` and have `.has(flag)`.
 - **Strings:** every `char*` / `const char*` is a `ZString`. A string literal passes as it is; a `String` goes through `.zstr_tcopy()`.
+- **Names:** `RAllocator` is `MemoryAllocator`, so that `Allocator` stays the one of C3.
 - **Callbacks:** C3 lambdas don't capture, so callbacks keep their `void* user_data`.
 - **Painter:** paint callbacks receive a `Painter*`; draw with `painter.rect(...)`.
 
@@ -182,7 +187,7 @@ fn int main(String[] args)
     defer raven::shutdown();
     
     raven::action_bind("app.quit", &on_quit, null);
-    if(catch err = raven::window_create_from_xml_file("./src/hello.xml") == raven::INVALID_ID) {
+    if (catch err = raven::window_create_from_xml_file("./src/hello.xml")) {
         io::printfn("Failed to create window: %s", err);
         return 1;
     }

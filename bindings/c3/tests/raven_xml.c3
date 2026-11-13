@@ -58,13 +58,9 @@ fn int main(String[] args)
 	Button quit = (Button)box.get_child(1);
 	ok &= expect(label.get_text().str_view() == "Hello from Raven", "the text of the Label");
 	ok &= expect(quit.get_type() == WidgetType.BUTTON, "the Button of the XML");
-	float x;
-	float y;
-	float w;
-	float h;
-	quit.get_rect(&x, &y, &w, &h);
-	ok &= expect(w > 0 && h > 0, "Widget.get_rect");
-	window.inject_mouse_move(x + w / 2, y + h / 2);
+	float[<4>] rect = quit.get_rect();         // { x, y, width, height }
+	ok &= expect(rect.z > 0 && rect.w > 0, "Widget.get_rect");
+	window.inject_mouse_move(rect.x + rect.z / 2, rect.y + rect.w / 2);
 	window.inject_mouse_button(MouseButton.LEFT, true);
 	window.inject_mouse_button(MouseButton.LEFT, false);
 	ok &= expect(!raven::is_running(), "OnClicked=\"app.quit\"");

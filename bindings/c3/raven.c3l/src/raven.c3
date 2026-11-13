@@ -20,6 +20,13 @@
 //     fail returns an Optional, with the fault of Rerror_get_last (or
 //     ERROR_FAILED when nothing was recorded); check() returns the last error;
 //   - what answers yes or no returns a bool, and takes a bool for R_TRUE;
+//   - a pointer and its count are a slice: plot.set_series_data(0, xs, ys);
+//   - what C fills through pointers is returned: window.get_size() is a
+//     CInt[<2>], window.get_frame_stats() a FrameStats;
+//   - functions of a structure are its methods: spring.kick(2.0);
+//   - memory of Raven is released the C3 way: file_read() copies the file
+//     with an Allocator (mem by default), window.capture() returns Pixels,
+//     released with pixels.free() (defer pixels.free(););
 //   - Painter is what a paint callback draws with: painter.rect(...).
 //
 //   import raven;
@@ -49,9 +56,26 @@ const ZString API_VERSION = "0.2";
 const CInt FALSE = 0;
 const CInt TRUE = 1;
 const Id INVALID_ID = (Id)0xFFFFFFFF;
+const CInt PRIM_RECT = 0;
+const CInt PRIM_GLYPH = 1;
+const CInt PRIM_SHADOW = 2;
+const CInt PRIM_LINE = 3;
+const CInt PRIM_TRIANGLE = 4;
+const CInt PRIM_GLASS = 5;
+const CInt PRIM_BLUR = 6;
+const CInt PRIM_CURVE = 7;
+const CInt PRIM_SHADER = 8;
+const CInt PRIM_MASK = 15;
+const CInt INSTANCE_TEXTURED = 16;
+const CInt INSTANCE_NO_POINTER = 32;
+const CInt COLOR_COUNT = 36;
+const CInt METRIC_COUNT = 20;
 
 <* Whether the handle names something (is not INVALID_ID). *>
 fn bool Id.is_valid(self) @inline => self != INVALID_ID;
+
+<* Index part of a handle: unique among live objects of one type, < 2^20. *>
+fn uint Id.index(self) @inline => c::r_id_index((c::Rid)self);
 
 <* The errors of Raven (Error) as faults, and ERROR_FAILED for a failure without one. *>
 excuse
@@ -97,7 +121,7 @@ fn fault last_fault()
 
 <*
  Returns the last error recorded (and clears it) as a fault: raven::check()!;
- Nothing when no error was recorded.
+ Nothing when no error was recorded. The C3 form of the macro Rerror_check.
 *>
 fn void? check()
 {
@@ -1385,6 +1409,72 @@ constset AccessibleRole : CInt
 	PANE = 0x0783,
 }
 
+constset DrawCommandType : CInt
+{
+	<* Draw `instance_count` instances starting at `first_instance`. *>
+	INSTANCES = 0,
+	<* Call the viewport callback (see raven_viewport.h), then restore the UI state. *>
+	CALLBACK = 1,
+	<*
+	 Capture what has been drawn so far as the backdrop of the GLASS
+	 instances that follow. `rect` is the area to capture, in pixels: the
+	 rest of the backdrop keeps what the earlier captures of the frame put
+	 there. Raven only emits the captures that are needed: one of the whole
+	 frame before its first glass, then one each time glass covers something
+	 drawn since that place was last captured. A backend may always capture
+	 the whole frame; a backend without glass ignores the command.
+	*>
+	BACKDROP = 2,
+	<*
+	 Like R_DRAW_INSTANCES, but the instances remove what was drawn where
+	 they are instead of drawing over it: the frame becomes transparent
+	 there, by as much as their coverage times the alpha of their color.
+	 That is how a window that can be seen through (R_WINDOW_TRANSPARENT)
+	 opens a hole in itself. With premultiplied colors it is the blend
+	 (ZERO, ONE_MINUS_SRC_ALPHA) for the color and for the alpha. A backend
+	 whose windows are never transparent ignores the command.
+	*>
+	ERASE = 3,
+	<*
+	 Like R_DRAW_INSTANCES (SHADER primitives), drawn with the fragment
+	 shader `shader` instead of the one of the UI. The shader sees the same
+	 inputs and bindings as the UI shader: the texture of the command, and
+	 the backdrop of glass when an R_DRAW_BACKDROP came before. A backend
+	 without custom shaders draws the instances as rounded rectangles.
+	*>
+	SHADER = 4,
+}
+
+constset TextureFormat : CInt
+{
+	<* 4 bytes per pixel: R, G, B, A. *>
+	RGBA8 = 0x02D0,
+	<* 1 byte per pixel, sampled as (1, 1, 1, value). Used by the glyph atlas. *>
+	ALPHA8 = 0x02D1,
+}
+
+constset WebFrames : CInt
+{
+	<* Exact pictures (default): text stays sharp. *>
+	PNG = 0x0480,
+	<* Lighter pictures, slightly blurred: for pages that move a lot (video, animation). *>
+	JPEG = 0x0481,
+}
+
+constset WebEvent : CInt
+{
+	<* The view shows another address (Rweb_view_get_url). *>
+	NAVIGATED = 0x04A0,
+	<* The title of the page changed (Rweb_view_get_title). *>
+	TITLE = 0x04A1,
+	<* A page starts loading. *>
+	LOADING = 0x04A2,
+	<* The page and what it refers to are loaded. *>
+	LOADED = 0x04A3,
+	<* The view cannot show pages any more (Rweb_view_get_error). *>
+	FAILED = 0x04A4,
+}
+
 <* Only seen through a pointer. *>
 typedef Painter = void;
 
@@ -1657,6 +1747,25 @@ alias XmlTagCreateCallback = fn Id(ZString tag, void* user_data);
 alias XmlTagAttributeCallback = fn CInt(Id widget, ZString name, ZString value, void* user_data);
 alias LocaleChangedCallback = fn void(ZString language, void* user_data);
 alias AccessiblePressCallback = fn void(Id widget, void* user_data);
+<*
+ A VkQueue must not be used by two threads at once. When the queue
+ is shared with the application, Raven calls `lock` before and `unlock`
+ after each use of the queue from its render thread.
+*>
+alias VulkanQueueLockCallback = fn void(void* user_data);
+<*
+ Receives the result of a script: `result` is its value written
+ as JSON ("42", "\"text\"", "{\"a\":1}", "null"), or NULL when the
+ script failed, `error` then telling why.
+*>
+alias WebResultCallback = fn void(Id view, ZString result, ZString error, void* user_data);
+<*
+ Receives what the page sends with
+ `window.raven.postMessage(value)`: a string as it is, anything else
+ written as JSON.
+*>
+alias WebMessageCallback = fn void(Id view, ZString message, void* user_data);
+alias WebEventCallback = fn void(Id view, WebEvent event, void* user_data);
 
 <*
  Optional settings for Rinit_ex. A zero-initialized structure selects the
@@ -1682,12 +1791,15 @@ struct InitDesc
 	float ui_scale;
 }
 
+alias MemoryAllocatorAllocFn = fn void*(usz size, void* user_data);
+alias MemoryAllocatorReallocFn = fn void*(void* ptr, usz size, void* user_data);
+alias MemoryAllocatorFreeFn = fn void(void* ptr, void* user_data);
 <* Memory functions of the application, to replace the allocator of Raven. See Rset_allocator. *>
-struct Allocator
+struct MemoryAllocator
 {
-	void* alloc;
-	void* realloc;
-	void* free;
+	MemoryAllocatorAllocFn alloc;
+	MemoryAllocatorReallocFn realloc;
+	MemoryAllocatorFreeFn free;
 	void* user_data;
 }
 
@@ -2136,18 +2248,252 @@ struct AccessibilitySettings
 	CInt screen_reader;
 }
 
+alias HostPlatformDescSetCursorFn = fn void(Id window, Cursor cursor, void* user_data);
+alias HostPlatformDescClipboardSetFn = fn void(ZString text, void* user_data);
+alias HostPlatformDescClipboardGetFn = fn ZString(void* user_data);
+alias HostPlatformDescWakeFn = fn void(void* user_data);
 struct HostPlatformDesc
 {
 	<* The pointer over `window` should look like `cursor`. May be NULL. *>
-	void* set_cursor;
+	HostPlatformDescSetCursorFn set_cursor;
 	<* Copies UTF-8 text to the clipboard of the application. NULL: the clipboard stays in the process. *>
-	void* clipboard_set;
+	HostPlatformDescClipboardSetFn clipboard_set;
 	<* The clipboard text, valid until the next call, or NULL. NULL: the clipboard stays in the process. *>
-	void* clipboard_get;
+	HostPlatformDescClipboardGetFn clipboard_get;
 	<* Raven has work to do (a timer, a posted task, a redraw): produce a frame soon. Thread-safe. May be NULL. *>
-	void* wake;
+	HostPlatformDescWakeFn wake;
 	void* user_data;
 }
+
+<* Memory exported by Rvulkan_texture_create_shared. *>
+struct SharedTextureInfo
+{
+	<* POSIX: file descriptor (opaque fd). Windows: HANDLE (opaque win32). The caller owns it. *>
+	iptr handle;
+	<* Size of the memory allocation backing the image, in bytes. *>
+	ulong allocation_size;
+	CInt width;
+	CInt height;
+}
+
+<*
+ One primitive. All positions are in framebuffer pixels, origin top-left.
+ Colors are 4 bytes R, G, B, A in memory order, straight (not premultiplied).
+
+   kind      rect                 uv              radii              border_width
+   RECT      x0, y0, x1, y1       u0, v0, u1, v1  tl, tr, br, bl     outline width
+   GLYPH     x0, y0, x1, y1       u0, v0, u1, v1  -                  -
+   SHADOW    x0, y0, x1, y1       -               tl, tr, br, bl     blur radius
+   LINE      ax, ay, bx, by       -               [0] = thickness    -
+   TRIANGLE  ax, ay, bx, by       -               [0], [1] = cx, cy  -
+   GLASS     x0, y0, x1, y1       see below       tl, tr, br, bl     bevel width
+   BLUR      x0, y0, x1, y1       see below       tl, tr, br, bl     outline width
+   CURVE     ax, ay, dx, dy       see below       bx, by, cx, cy     thickness
+   SHADER    x0, y0, x1, y1       params 0..3     tl, tr, br, bl     time (seconds)
+
+ Fragments outside `clip` (x0, y0, x1, y1) are discarded.
+
+ GLASS shows the *backdrop*: the frame as it was when the last
+ R_DRAW_BACKDROP command was executed, sharp and blurred. Its fields are
+   uv[0]         frost, 0 = clear glass .. 1 = fully blurred
+   uv[1]         refraction: how far, in pixels, the rim bends the backdrop
+   uv[2]         saturation of the backdrop, 1 = unchanged
+   uv[3]         brightness added to the result (pressed / highlighted glass)
+   color         tint laid over the backdrop; its alpha is the strength
+   border_color  color of the light caught by the rim; its alpha is the intensity
+   border_width  width in pixels of the curved rim that refracts
+   flags         bits 8..15 = opacity of the whole primitive, 0..255
+ A backend without backdrop support may draw GLASS as a rounded rectangle
+ filled with `color`.
+
+ CURVE is the cubic Bezier curve from a (rect[0], rect[1]) to d (rect[2],
+ rect[3]) with the control points b and c (radii), drawn as a stroke with
+ round ends:
+   color         color at a
+   border_color  color at d; the stroke shades from one to the other
+   border_width  thickness of the stroke, in pixels
+   uv[0]         radius of the halo around the stroke, in pixels (0 = none)
+   uv[1]         opacity of the halo next to the stroke, 0..1
+   uv[2]         where the pulses are: they move from a to d as it grows (one pulse takes the place of the next every 1)
+   uv[3]         number of pulses along the curve (0 = none)
+   flags         bits 8..15 = how bright the pulses are, 0..255
+ A backend may draw it as a chain of LINE primitives.
+
+ BLUR shows the backdrop out of focus, flat (no rim, no bending):
+   uv[0]         radius of the blur, in pixels
+   uv[1]         grain, 0 = none .. 1 = frosted
+   uv[2]         saturation of the backdrop, 1 = unchanged
+   uv[3]         brightness added to the result
+   color         tint laid over the backdrop; its alpha is the strength
+   border_color  color of the outline, when border_width is not 0
+   flags         bits 8..15 = opacity of the whole primitive, 0..255
+ A backend without backdrop support may draw it as a rounded rectangle
+ filled with `color`.
+
+ SHADER is drawn by the fragment shader of its command (R_DRAW_SHADER),
+ an effect of the application or of Raven (raven_shader.h):
+   uv            four parameters of the effect, as the application gave them
+   color         first color of the effect
+   border_color  second color of the effect
+   border_width  time of the frame, in seconds (for animated effects)
+   flags         bits 8..15 = opacity of the whole primitive, 0..255;
+                 bits 16..23 = how much the pointer is over it (hover), 0..255;
+                 bits 24..31 = how much it is pressed, 0..255;
+                 R_INSTANCE_NO_POINTER: the effect does not follow the pointer
+ The effect also gets RDrawData::pointer. A backend without custom shaders
+ may draw it as a rounded rectangle filled with `color`.
+
+ In a window that can be seen through (RNativeWindow::transparent), the
+ alpha of the frame is what the window system blends with: GLASS and BLUR
+ keep the alpha of the backdrop where they are not tinted.
+*>
+struct DrawInstance
+{
+	float[4] rect;
+	float[4] uv;
+	float[4] clip;
+	float[4] radii;
+	uint color;
+	uint border_color;
+	float border_width;
+	uint flags;
+}
+
+struct DrawCommand
+{
+	DrawCommandType type;
+	<* Texture sampled by the textured instances of the command, or R_INVALID_ID. *>
+	Id texture;
+	uint first_instance;
+	uint instance_count;
+	ViewportDrawCallback callback;
+	void* user_data;
+	Id viewport;
+	<* x, y, width, height in pixels. *>
+	CInt[4] rect;
+	CInt[4] clip;
+	Id shader;
+}
+
+<* Everything needed to render one frame of one window. *>
+struct DrawData
+{
+	Id window;
+	DrawInstance* instances;
+	uint instance_count;
+	DrawCommand* commands;
+	uint command_count;
+	uint framebuffer_width;
+	uint framebuffer_height;
+	float[4] clear_color;
+	ulong frame_index;
+	<* Pixels per logical unit of the window: effects sized in pixels (blur) follow it. *>
+	float scale;
+	<* R_TRUE: the frame waits for the vertical synchronization (Rset_vsync). *>
+	CInt vsync;
+	<* Where the pointer is, in framebuffer pixels; -1e6, -1e6 when it is not over the window (for the effects, R_DRAW_SHADER). *>
+	float[2] pointer;
+}
+
+struct TextureDesc
+{
+	uint width;
+	uint height;
+	TextureFormat format;
+	FilterType filter;
+}
+
+struct BackendInitInfo
+{
+	ZString app_name;
+	CInt enable_validation;
+	CInt vsync;
+	WindowSystem window_system;
+	<* Display connection of the window system (X11 Display*), or NULL. *>
+	void* native_display;
+}
+
+<* Filled by RenderFrame when a capture is requested. *>
+struct Capture
+{
+	<* RGBA8, allocated with Rpixels_alloc. NULL when capture is unsupported. *>
+	char* pixels;
+	CInt width;
+	CInt height;
+}
+
+alias BackendVTableInitFn = fn CInt(BackendInitInfo* info);
+alias BackendVTableShutdownFn = fn void();
+alias BackendVTableCreateSurfaceFn = fn CInt(Id window, NativeWindow* native, uint width, uint height);
+alias BackendVTableDestroySurfaceFn = fn void(Id window);
+alias BackendVTableCreateTextureFn = fn CInt(Id texture, TextureDesc* desc, void* pixels);
+alias BackendVTableUpdateTextureFn = fn void(Id texture, uint x, uint y, uint width, uint height, void* pixels);
+alias BackendVTableSetTextureFilterFn = fn void(Id texture, FilterType filter);
+alias BackendVTableDestroyTextureFn = fn void(Id texture);
+alias BackendVTableRenderFrameFn = fn void(DrawData* data, Capture* capture);
+alias BackendVTableWaitIdleFn = fn void();
+alias BackendVTableCreateShaderFn = fn CInt(Id shader, uint* spirv, usz size);
+alias BackendVTableDestroyShaderFn = fn void(Id shader);
+struct BackendVTable
+{
+	ZString name;
+	BackendVTableInitFn init;
+	BackendVTableShutdownFn shutdown;
+	<* Creates the presentation surface (swapchain) of a window. *>
+	BackendVTableCreateSurfaceFn create_surface;
+	BackendVTableDestroySurfaceFn destroy_surface;
+	<* `pixels` may be NULL (content undefined until UpdateTexture). *>
+	BackendVTableCreateTextureFn create_texture;
+	BackendVTableUpdateTextureFn update_texture;
+	BackendVTableSetTextureFilterFn set_texture_filter;
+	BackendVTableDestroyTextureFn destroy_texture;
+	<*
+	 Renders and presents one frame. The surface must follow
+	 data->framebuffer_width / height (recreate the swapchain when they change).
+	*>
+	BackendVTableRenderFrameFn render_frame;
+	<* Blocks until the GPU finished all submitted work. *>
+	BackendVTableWaitIdleFn wait_idle;
+	<*
+	 Optional (NULL: SHADER primitives are drawn as plain rounded
+	 rectangles). Makes a fragment shader of SPIR-V words usable by the
+	 R_DRAW_SHADER commands that name `shader`. R_FALSE when it is refused.
+	*>
+	BackendVTableCreateShaderFn create_shader;
+	BackendVTableDestroyShaderFn destroy_shader;
+}
+
+<*
+ Pixels made by Raven (Window.capture, image_decode): `width` x `height`
+ tightly packed RGBA8 pixels. Release them with free(): defer pixels.free();
+*>
+struct Pixels
+{
+	char* data;
+	CInt width;
+	CInt height;
+}
+
+<* The bytes of the pixels: width * height * 4 of them. *>
+fn char[] Pixels.bytes(&self) @inline => self.data[:(usz)self.width * (usz)self.height * 4];
+
+<* Releases the pixels (Rpixels_free). *>
+fn void Pixels.free(&self)
+{
+	if (self.data) c::r_pixels_free(self.data);
+	*self = {};
+}
+
+// ---- methods of the structures
+
+<* Pushes a spring away from its target (units per second): it bounces back. *>
+fn void Spring.kick(&self, float velocity) @inline => c::r_spring_kick((c::RSpring*)self, velocity);
+
+<* Puts a spring at rest on a value, without animation. *>
+fn void Spring.set(&self, float value) @inline => c::r_spring_set((c::RSpring*)self, value);
+
+<* White to white, no parameter, no texture, square corners, animated when the shader is. *>
+fn void ShaderLook.init(&self) @inline => c::r_shader_look_init((c::RShaderLook*)self);
 
 // ---- Widget
 
@@ -2270,10 +2616,28 @@ fn void Widget.set_min_size(self, float width, float height) @inline => c::r_wid
 
 fn void Widget.set_max_size(self, float width, float height) @inline => c::r_widget_set_max_size((c::Rid)self, width, height);
 
-<* Bounds of the widget in its window, in logical units, after the last layout. *>
-fn void Widget.get_rect(self, float* x, float* y, float* width, float* height) @inline => c::r_widget_get_rect((c::Rid)self, x, y, width, height);
+<*
+ Bounds of the widget in its window, in logical units, after the last layout.
+ Returned as { x, y, width, height }.
+*>
+fn float[<4>] Widget.get_rect(self)
+{
+	float x;
+	float y;
+	float width;
+	float height;
+	c::r_widget_get_rect((c::Rid)self, &x, &y, &width, &height);
+	return { x, y, width, height };
+}
 
-fn void Widget.get_desired_size(self, float* width, float* height) @inline => c::r_widget_get_desired_size((c::Rid)self, width, height);
+<* Returned as { width, height }. *>
+fn float[<2>] Widget.get_desired_size(self)
+{
+	float width;
+	float height;
+	c::r_widget_get_desired_size((c::Rid)self, &width, &height);
+	return { width, height };
+}
 
 fn bool Widget.is_hovered(self) @inline => c::r_widget_is_hovered((c::Rid)self) != 0;
 
@@ -2423,9 +2787,9 @@ fn Direction Widget.get_direction(self) @inline => (Direction)c::r_widget_get_di
  Creates a widget tree from a document whose root element is a
  widget. The caller owns the returned widget until it is added to a parent.
 *>
-fn Widget? widget_create_from_xml(ZString xml, usz size)
+fn Widget? widget_create_from_xml(String xml)
 {
-	Id result = (Id)c::r_widget_create_from_xml((char*)xml, size);
+	Id result = (Id)c::r_widget_create_from_xml(xml.ptr, xml.len);
 	if (result == INVALID_ID) return last_fault()~;
 	return (Widget)result;
 }
@@ -2665,8 +3029,18 @@ fn void Slider.set_value(self, float value) @inline => c::r_slider_set_value((c:
 
 fn float Slider.get_value(self) @inline => c::r_slider_get_value((c::Rid)self);
 
-<* The range given with Rslider_set_range and the step (NULL for what is not wanted). *>
-fn void Slider.get_range(self, float* minimum, float* maximum, float* step) @inline => c::r_slider_get_range((c::Rid)self, minimum, maximum, step);
+<*
+ The range given with Rslider_set_range and the step (NULL for what is not wanted).
+ Returned as { minimum, maximum, step }.
+*>
+fn float[<3>] Slider.get_range(self)
+{
+	float minimum;
+	float maximum;
+	float step;
+	c::r_slider_get_range((c::Rid)self, &minimum, &maximum, &step);
+	return { minimum, maximum, step };
+}
 
 <* Snaps the value to multiples of `step`. 0 = continuous (default). *>
 fn void Slider.set_step(self, float step) @inline => c::r_slider_set_step((c::Rid)self, step);
@@ -2701,8 +3075,16 @@ fn Image image_create() @inline => (Image)c::r_widget_create(c::R_WIDGET_IMAGE);
  so that the decoding can be done away from the UI thread.
  Returns The pixels, to release with Rpixels_free; NULL when the data
  is not an image Raven can read.
+ Release the pixels with Pixels.free().
 *>
-alias image_decode = c::r_image_decode;
+fn Pixels? image_decode(char[] data)
+{
+	CInt width;
+	CInt height;
+	char* pixels = c::r_image_decode((void*)data.ptr, data.len, &width, &height);
+	if (!pixels) return last_fault()~;
+	return { .data = pixels, .width = width, .height = height };
+}
 
 fn void Image.set_texture(self, Id texture) @inline => c::r_image_set_texture((c::Rid)self, (c::Rid)texture);
 
@@ -2764,8 +3146,18 @@ fn void SpinBox.set_value(self, double value) @inline => c::r_spin_box_set_value
 
 fn double SpinBox.get_value(self) @inline => c::r_spin_box_get_value((c::Rid)self);
 
-<* The range and the step (NULL for what is not wanted). *>
-fn void SpinBox.get_range(self, double* minimum, double* maximum, double* step) @inline => c::r_spin_box_get_range((c::Rid)self, minimum, maximum, step);
+<*
+ The range and the step (NULL for what is not wanted).
+ Returned as { minimum, maximum, step }.
+*>
+fn double[<3>] SpinBox.get_range(self)
+{
+	double minimum;
+	double maximum;
+	double step;
+	c::r_spin_box_get_range((c::Rid)self, &minimum, &maximum, &step);
+	return { minimum, maximum, step };
+}
 
 fn void SpinBox.set_step(self, double step) @inline => c::r_spin_box_set_step((c::Rid)self, step);
 
@@ -3064,7 +3456,14 @@ fn void ScrollBox.set_scroll_both(self, bool enabled) @inline => c::r_scroll_box
 
 fn void ScrollBox.set_offset(self, float x, float y) @inline => c::r_scroll_box_set_offset((c::Rid)self, x, y);
 
-fn void ScrollBox.get_offset(self, float* x, float* y) @inline => c::r_scroll_box_get_offset((c::Rid)self, x, y);
+<* Returned as { x, y }. *>
+fn float[<2>] ScrollBox.get_offset(self)
+{
+	float x;
+	float y;
+	c::r_scroll_box_get_offset((c::Rid)self, &x, &y);
+	return { x, y };
+}
 
 fn void ScrollBox.scroll_to_end(self) @inline => c::r_scroll_box_scroll_to_end((c::Rid)self);
 
@@ -3184,7 +3583,14 @@ fn void TextEditor.insert_text(self, ZString text) @inline => c::r_text_editor_i
 
 fn void TextEditor.set_cursor(self, CInt line, CInt column) @inline => c::r_text_editor_set_cursor((c::Rid)self, line, column);
 
-fn void TextEditor.get_cursor(self, CInt* line, CInt* column) @inline => c::r_text_editor_get_cursor((c::Rid)self, line, column);
+<* Returned as { line, column }. *>
+fn CInt[<2>] TextEditor.get_cursor(self)
+{
+	CInt line;
+	CInt column;
+	c::r_text_editor_get_cursor((c::Rid)self, &line, &column);
+	return { line, column };
+}
 
 <* Selects from one position to another; the cursor is on the second. *>
 fn void TextEditor.select(self, CInt from_line, CInt from_column, CInt to_line, CInt to_column) @inline => c::r_text_editor_select((c::Rid)self, from_line, from_column, to_line, to_column);
@@ -3192,7 +3598,7 @@ fn void TextEditor.select(self, CInt from_line, CInt from_column, CInt to_line, 
 fn void TextEditor.select_all(self) @inline => c::r_text_editor_select_all((c::Rid)self);
 
 <* Start and end of the selection, in the order of the text. Returns R_FALSE when nothing is selected. *>
-fn CInt TextEditor.get_selection(self, CInt* from_line, CInt* from_column, CInt* to_line, CInt* to_column) @inline => c::r_text_editor_get_selection((c::Rid)self, from_line, from_column, to_line, to_column);
+fn bool TextEditor.get_selection(self, CInt* from_line, CInt* from_column, CInt* to_line, CInt* to_column) @inline => c::r_text_editor_get_selection((c::Rid)self, from_line, from_column, to_line, to_column) != 0;
 
 <* Returns The selected text, "" when there is none. Valid until the next call or the next edit. *>
 fn ZString TextEditor.get_selected_text(self) @inline => (ZString)c::r_text_editor_get_selected_text((c::Rid)self);
@@ -3526,7 +3932,7 @@ fn ZString FileBrowser.get_directory(self) @inline => (ZString)c::r_file_browser
 fn void FileBrowser.refresh(self) @inline => c::r_file_browser_refresh((c::Rid)self);
 
 <* Kinds of files the user chooses from; the first one is active. The strings are copied. *>
-fn void FileBrowser.set_filters(self, FileFilter* filters, CInt count) @inline => c::r_file_browser_set_filters((c::Rid)self, (c::RFileFilter*)filters, count);
+fn void FileBrowser.set_filters(self, FileFilter[] filters) @inline => c::r_file_browser_set_filters((c::Rid)self, (c::RFileFilter*)filters.ptr, (CInt)filters.len);
 
 fn void FileBrowser.set_show_hidden(self, CInt show) @inline => c::r_file_browser_set_show_hidden((c::Rid)self, show);
 
@@ -3593,10 +3999,24 @@ fn void? Viewport.set_native(self, bool enabled)
 }
 
 <* Fills `native` with the handles of the child window. *>
-fn CInt Viewport.get_native_handle(self, NativeWindow* native) @inline => c::r_viewport_get_native_handle((c::Rid)self, (c::RNativeWindow*)native);
+fn NativeWindow? Viewport.get_native_handle(self)
+{
+	NativeWindow native;
+	if (!c::r_viewport_get_native_handle((c::Rid)self, (c::RNativeWindow*)&native)) return last_fault()~;
+	return native;
+}
 
-<* Size of the viewport in pixels after the last layout. *>
-fn void Viewport.get_pixel_size(self, CInt* width, CInt* height) @inline => c::r_viewport_get_pixel_size((c::Rid)self, width, height);
+<*
+ Size of the viewport in pixels after the last layout.
+ Returned as { width, height }.
+*>
+fn CInt[<2>] Viewport.get_pixel_size(self)
+{
+	CInt width;
+	CInt height;
+	c::r_viewport_get_pixel_size((c::Rid)self, &width, &height);
+	return { width, height };
+}
 
 fn void Viewport.set_resize_callback(self, ViewportResizeCallback callback, void* user_data) @inline => c::r_viewport_set_resize_callback((c::Rid)self, (c::RViewportResizeCallback)callback, user_data);
 
@@ -3617,6 +4037,79 @@ fn void Custom.set_paint_callback(self, PaintCallback callback, void* user_data)
 
 <* Reports the desired size of the widget. Without it the widget asks for 0 x 0. *>
 fn void Custom.set_measure_callback(self, MeasureCallback callback, void* user_data) @inline => c::r_custom_set_measure_callback((c::Rid)self, (c::RMeasureCallback)callback, user_data);
+
+// ---- WebView
+
+typedef WebView = inline Widget;
+
+<* Creates a web view: a widget like the others (size, slot, visibility...). *>
+fn WebView web_view_create() @inline => (WebView)c::r_web_view_create();
+
+<* Returns R_TRUE when the widget is a web view. *>
+fn bool WebView.is_valid(self) @inline => c::r_web_view_is_valid((c::Rid)self) != 0;
+
+<* Goes to an address ("https://...", "file:///...", "about:blank"). *>
+fn void WebView.load_url(self, ZString url) @inline => c::r_web_view_load_url((c::Rid)self, (char*)url);
+
+<* Shows a file of the computer (an .html file and what it refers to). *>
+fn void WebView.load_file(self, ZString path) @inline => c::r_web_view_load_file((c::Rid)self, (char*)path);
+
+<* Shows HTML given as text. *>
+fn void WebView.load_html(self, ZString html, ZString base_url) @inline => c::r_web_view_load_html((c::Rid)self, (char*)html, (char*)base_url);
+
+fn void WebView.reload(self) @inline => c::r_web_view_reload((c::Rid)self);
+
+fn void WebView.stop(self) @inline => c::r_web_view_stop((c::Rid)self);
+
+fn void WebView.go_back(self) @inline => c::r_web_view_go_back((c::Rid)self);
+
+fn void WebView.go_forward(self) @inline => c::r_web_view_go_forward((c::Rid)self);
+
+fn bool WebView.can_go_back(self) @inline => c::r_web_view_can_go_back((c::Rid)self) != 0;
+
+fn bool WebView.can_go_forward(self) @inline => c::r_web_view_can_go_forward((c::Rid)self) != 0;
+
+<* Returns The address of the page shown. Valid until it changes. *>
+fn ZString WebView.get_url(self) @inline => (ZString)c::r_web_view_get_url((c::Rid)self);
+
+fn ZString WebView.get_title(self) @inline => (ZString)c::r_web_view_get_title((c::Rid)self);
+
+fn bool WebView.is_loading(self) @inline => c::r_web_view_is_loading((c::Rid)self) != 0;
+
+<* Returns R_TRUE once the browser shows pages in this view (it takes a moment to start). *>
+fn bool WebView.is_ready(self) @inline => c::r_web_view_is_ready((c::Rid)self) != 0;
+
+<* Returns What went wrong ("no browser found", "the browser stopped"...), or "" when all is well. *>
+fn ZString WebView.get_error(self) @inline => (ZString)c::r_web_view_get_error((c::Rid)self);
+
+<*
+ The texture that holds the last picture of the page, or
+ R_INVALID_ID before the first one arrived. It belongs to the view; use
+ it to draw the page somewhere else as well (Rdraw_image, an Image).
+*>
+fn Texture WebView.get_texture(self) @inline => (Texture)c::r_web_view_get_texture((c::Rid)self);
+
+<* Size of the content of the page: 1 = as the page asks, 1.25 = a quarter larger. *>
+fn void WebView.set_zoom(self, float zoom) @inline => c::r_web_view_set_zoom((c::Rid)self, zoom);
+
+fn float WebView.get_zoom(self) @inline => c::r_web_view_get_zoom((c::Rid)self);
+
+fn void WebView.set_frames(self, WebFrames format, CInt quality) @inline => c::r_web_view_set_frames((c::Rid)self, (c::RWebFrames)format, quality);
+
+<*
+ Runs JavaScript in the page. If the script gives a promise, the
+ result is what the promise resolves to.
+*>
+fn void WebView.run_javascript(self, ZString script, WebResultCallback callback, void* user_data) @inline => c::r_web_view_run_javascript((c::Rid)self, (char*)script, (c::RWebResultCallback)callback, user_data);
+
+fn void WebView.set_message_callback(self, WebMessageCallback callback, void* user_data) @inline => c::r_web_view_set_message_callback((c::Rid)self, (c::RWebMessageCallback)callback, user_data);
+
+<*
+ Called when something happens in the page. The action of the
+ widget (Rwidget_set_action, OnChanged in XML) is fired as well each
+ time the address changes.
+*>
+fn void WebView.set_event_callback(self, WebEventCallback callback, void* user_data) @inline => c::r_web_view_set_event_callback((c::Rid)self, (c::RWebEventCallback)callback, user_data);
 
 // ---- MenuBar
 
@@ -3704,7 +4197,16 @@ fn ColorPicker color_picker_create() @inline => (ColorPicker)c::r_color_picker_c
 <* Sets the color (0..1 each). The callback is not called. *>
 fn void ColorPicker.set_color(self, float r, float g, float b, float a) @inline => c::r_color_picker_set_color((c::Rid)self, r, g, b, a);
 
-fn void ColorPicker.get_color(self, float* r, float* g, float* b, float* a) @inline => c::r_color_picker_get_color((c::Rid)self, r, g, b, a);
+<* Returned as { r, g, b, a }. *>
+fn float[<4>] ColorPicker.get_color(self)
+{
+	float r;
+	float g;
+	float b;
+	float a;
+	c::r_color_picker_get_color((c::Rid)self, &r, &g, &b, &a);
+	return { r, g, b, a };
+}
 
 <*
  The same color as hue (0..360), saturation and value (0..1).
@@ -3713,7 +4215,15 @@ fn void ColorPicker.get_color(self, float* r, float* g, float* b, float* a) @inl
 *>
 fn void ColorPicker.set_hsv(self, float hue, float saturation, float value) @inline => c::r_color_picker_set_hsv((c::Rid)self, hue, saturation, value);
 
-fn void ColorPicker.get_hsv(self, float* hue, float* saturation, float* value) @inline => c::r_color_picker_get_hsv((c::Rid)self, hue, saturation, value);
+<* Returned as { hue, saturation, value }. *>
+fn float[<3>] ColorPicker.get_hsv(self)
+{
+	float hue;
+	float saturation;
+	float value;
+	c::r_color_picker_get_hsv((c::Rid)self, &hue, &saturation, &value);
+	return { hue, saturation, value };
+}
 
 <*
  Sets the color from text: "#RGB", "#RRGGBB", "#RRGGBBAA" (the
@@ -3785,7 +4295,14 @@ fn void Timeline.set_snapping(self, bool enabled) @inline => c::r_timeline_set_s
 <* The part of the sequence that is shown. Zooming is showing less. *>
 fn void Timeline.set_view(self, double start, double end) @inline => c::r_timeline_set_view((c::Rid)self, start, end);
 
-fn void Timeline.get_view(self, double* start, double* end) @inline => c::r_timeline_get_view((c::Rid)self, start, end);
+<* Returned as { start, end }. *>
+fn double[<2>] Timeline.get_view(self)
+{
+	double start;
+	double end;
+	c::r_timeline_get_view((c::Rid)self, &start, &end);
+	return { start, end };
+}
 
 <*
  Makes the playhead run by itself, at the speed of the clock,
@@ -4074,7 +4591,15 @@ fn CInt NodeGraph.get_input_link(self, CInt input_pin) @inline => c::r_node_grap
 <* What the middle of the widget shows: a point of the canvas, and how large (1 = one unit per logical unit). *>
 fn void NodeGraph.set_view(self, float center_x, float center_y, float zoom) @inline => c::r_node_graph_set_view((c::Rid)self, center_x, center_y, zoom);
 
-fn void NodeGraph.get_view(self, float* center_x, float* center_y, float* zoom) @inline => c::r_node_graph_get_view((c::Rid)self, center_x, center_y, zoom);
+<* Returned as { center_x, center_y, zoom }. *>
+fn float[<3>] NodeGraph.get_view(self)
+{
+	float center_x;
+	float center_y;
+	float zoom;
+	c::r_node_graph_get_view((c::Rid)self, &center_x, &center_y, &zoom);
+	return { center_x, center_y, zoom };
+}
 
 <* Converts a point of the widget (from its corner, as in the events) to the canvas, and back, with the view as it is shown now. *>
 fn void NodeGraph.to_canvas(self, float x, float y, float* canvas_x, float* canvas_y) @inline => c::r_node_graph_to_canvas((c::Rid)self, x, y, canvas_x, canvas_y);
@@ -4317,7 +4842,7 @@ fn void BlockEditor.remove_block(self, CInt block) @inline => c::r_block_editor_
 fn void BlockEditor.clear(self) @inline => c::r_block_editor_clear((c::Rid)self);
 
 <* Puts a block (with what is under it) at a place of another one. R_FALSE when it does not fit there. *>
-fn CInt BlockEditor.attach(self, CInt block, CInt target, BlockPlace place, CInt index) @inline => c::r_block_editor_attach((c::Rid)self, block, target, (c::RBlockPlace)place, index);
+fn bool BlockEditor.attach(self, CInt block, CInt target, BlockPlace place, CInt index) @inline => c::r_block_editor_attach((c::Rid)self, block, target, (c::RBlockPlace)place, index) != 0;
 
 <* Takes a block (with what is under it) out: a script of its own at x, y. *>
 fn void BlockEditor.detach(self, CInt block, float x, float y) @inline => c::r_block_editor_detach((c::Rid)self, block, x, y);
@@ -4389,8 +4914,18 @@ fn CInt BlockEditor.get_selected(self, CInt index) @inline => c::r_block_editor_
 <* Selects a block (add: R_FALSE clears the selection first ; block 0 : only clears). *>
 fn void BlockEditor.select(self, CInt block, CInt add) @inline => c::r_block_editor_select((c::Rid)self, block, add);
 
-<* Pan (canvas units at the top left) and zoom. *>
-fn void BlockEditor.get_view(self, float* x, float* y, float* zoom) @inline => c::r_block_editor_get_view((c::Rid)self, x, y, zoom);
+<*
+ Pan (canvas units at the top left) and zoom.
+ Returned as { x, y, zoom }.
+*>
+fn float[<3>] BlockEditor.get_view(self)
+{
+	float x;
+	float y;
+	float zoom;
+	c::r_block_editor_get_view((c::Rid)self, &x, &y, &zoom);
+	return { x, y, zoom };
+}
 
 fn void BlockEditor.set_view(self, float x, float y, float zoom) @inline => c::r_block_editor_set_view((c::Rid)self, x, y, zoom);
 
@@ -4486,7 +5021,15 @@ fn DatePicker date_picker_create() @inline => (DatePicker)c::r_widget_create(c::
 <* Sets the date (today when the picker is created). An invalid date is refused. *>
 fn void DatePicker.set_date(self, CInt year, CInt month, CInt day) @inline => c::r_date_picker_set_date((c::Rid)self, year, month, day);
 
-fn void DatePicker.get_date(self, CInt* year, CInt* month, CInt* day) @inline => c::r_date_picker_get_date((c::Rid)self, year, month, day);
+<* Returned as { year, month, day }. *>
+fn CInt[<3>] DatePicker.get_date(self)
+{
+	CInt year;
+	CInt month;
+	CInt day;
+	c::r_date_picker_get_date((c::Rid)self, &year, &month, &day);
+	return { year, month, day };
+}
 
 <* The earliest and the latest dates that can be chosen; 0 for year leaves that side open. *>
 fn void DatePicker.set_range(self, CInt min_year, CInt min_month, CInt min_day, CInt max_year, CInt max_month, CInt max_day) @inline => c::r_date_picker_set_range((c::Rid)self, min_year, min_month, min_day, max_year, max_month, max_day);
@@ -4520,7 +5063,15 @@ fn TimePicker time_picker_create() @inline => (TimePicker)c::r_widget_create(c::
 
 fn void TimePicker.set_time(self, CInt hour, CInt minute, CInt second) @inline => c::r_time_picker_set_time((c::Rid)self, hour, minute, second);
 
-fn void TimePicker.get_time(self, CInt* hour, CInt* minute, CInt* second) @inline => c::r_time_picker_get_time((c::Rid)self, hour, minute, second);
+<* Returned as { hour, minute, second }. *>
+fn CInt[<3>] TimePicker.get_time(self)
+{
+	CInt hour;
+	CInt minute;
+	CInt second;
+	c::r_time_picker_get_time((c::Rid)self, &hour, &minute, &second);
+	return { hour, minute, second };
+}
 
 fn void TimePicker.set_seconds_visible(self, bool visible) @inline => c::r_time_picker_set_seconds_visible((c::Rid)self, (CInt)visible);
 
@@ -4667,10 +5218,10 @@ fn void Plot.set_series_name(self, CInt series, ZString name) @inline => c::r_pl
 fn ZString Plot.get_series_name(self, CInt series) @inline => (ZString)c::r_plot_get_series_name((c::Rid)self, series);
 
 <* Replaces the points of a series with `count` points, copied. *>
-fn void Plot.set_series_data(self, CInt series, double* x, double* y, CInt count) @inline => c::r_plot_set_series_data((c::Rid)self, series, x, y, count);
+fn void Plot.set_series_data(self, CInt series, double[] x, double[] y) @inline => c::r_plot_set_series_data((c::Rid)self, series, (x.len ? x.ptr : null), y.ptr, (CInt)y.len);
 
 <* Adds points after those of a series (x NULL: numbered after the last one). *>
-fn void Plot.append_series_data(self, CInt series, double* x, double* y, CInt count) @inline => c::r_plot_append_series_data((c::Rid)self, series, x, y, count);
+fn void Plot.append_series_data(self, CInt series, double[] x, double[] y) @inline => c::r_plot_append_series_data((c::Rid)self, series, (x.len ? x.ptr : null), y.ptr, (CInt)y.len);
 
 <* Adds one point after those of a series. *>
 fn void Plot.add_point(self, CInt series, double x, double y) @inline => c::r_plot_add_point((c::Rid)self, series, x, y);
@@ -4680,7 +5231,7 @@ fn void Plot.clear_series_data(self, CInt series) @inline => c::r_plot_clear_ser
 fn CInt Plot.get_point_count(self, CInt series) @inline => c::r_plot_get_point_count((c::Rid)self, series);
 
 <* One point of a series. Returns R_FALSE when there is no such point. *>
-fn CInt Plot.get_point(self, CInt series, CInt index, double* x, double* y) @inline => c::r_plot_get_point((c::Rid)self, series, index, x, y);
+fn bool Plot.get_point(self, CInt series, CInt index, double* x, double* y) @inline => c::r_plot_get_point((c::Rid)self, series, index, x, y) != 0;
 
 <* Keeps only the last `max` points of a series, for data that streams in (0: all of them, the default). *>
 fn void Plot.set_series_max_points(self, CInt series, CInt max) @inline => c::r_plot_set_series_max_points((c::Rid)self, series, max);
@@ -4765,7 +5316,7 @@ fn void Plot.set_mouse_text(self, bool shown) @inline => c::r_plot_set_mouse_tex
 fn void Plot.set_tooltips(self, bool shown) @inline => c::r_plot_set_tooltips((c::Rid)self, (CInt)shown);
 
 <* Where the pointer is, in the units of R_PLOT_X and R_PLOT_Y. Returns R_TRUE when it is over the data. *>
-fn CInt Plot.get_mouse_position(self, double* x, double* y) @inline => c::r_plot_get_mouse_position((c::Rid)self, x, y);
+fn bool Plot.get_mouse_position(self, double* x, double* y) @inline => c::r_plot_get_mouse_position((c::Rid)self, x, y) != 0;
 
 <* Where a point of the data (R_PLOT_X, R_PLOT_Y) is in the widget, in logical units from its corner. *>
 fn void Plot.data_to_point(self, double x, double y, float* point_x, float* point_y) @inline => c::r_plot_data_to_point((c::Rid)self, x, y, point_x, point_y);
@@ -4801,7 +5352,12 @@ fn void Plot.set_series_toggled_callback(self, PlotSeriesCallback callback, void
 
 typedef Window = inline Id;
 
-fn void Window.get_frame_stats(self, FrameStats* stats) @inline => c::r_window_get_frame_stats((c::Rid)self, (c::RFrameStats*)stats);
+fn FrameStats Window.get_frame_stats(self)
+{
+	FrameStats stats;
+	c::r_window_get_frame_stats((c::Rid)self, (c::RFrameStats*)&stats);
+	return stats;
+}
 
 <* Opens a top-level window. *>
 fn Window window_create(ZString title, CInt width, CInt height, WindowFlags flags) @inline => (Window)c::r_window_create((char*)title, width, height, (c::Ruint)flags);
@@ -4825,16 +5381,39 @@ fn ZString Window.get_title(self) @inline => (ZString)c::r_window_get_title((c::
 
 fn void Window.set_size(self, CInt width, CInt height) @inline => c::r_window_set_size((c::Rid)self, width, height);
 
-fn void Window.get_size(self, CInt* width, CInt* height) @inline => c::r_window_get_size((c::Rid)self, width, height);
+<* Returned as { width, height }. *>
+fn CInt[<2>] Window.get_size(self)
+{
+	CInt width;
+	CInt height;
+	c::r_window_get_size((c::Rid)self, &width, &height);
+	return { width, height };
+}
 
 fn void Window.set_min_size(self, CInt width, CInt height) @inline => c::r_window_set_min_size((c::Rid)self, width, height);
 
 fn void Window.set_position(self, CInt x, CInt y) @inline => c::r_window_set_position((c::Rid)self, x, y);
 
-fn void Window.get_position(self, CInt* x, CInt* y) @inline => c::r_window_get_position((c::Rid)self, x, y);
+<* Returned as { x, y }. *>
+fn CInt[<2>] Window.get_position(self)
+{
+	CInt x;
+	CInt y;
+	c::r_window_get_position((c::Rid)self, &x, &y);
+	return { x, y };
+}
 
-<* Size of the drawable area in pixels. *>
-fn void Window.get_framebuffer_size(self, CInt* width, CInt* height) @inline => c::r_window_get_framebuffer_size((c::Rid)self, width, height);
+<*
+ Size of the drawable area in pixels.
+ Returned as { width, height }.
+*>
+fn CInt[<2>] Window.get_framebuffer_size(self)
+{
+	CInt width;
+	CInt height;
+	c::r_window_get_framebuffer_size((c::Rid)self, &width, &height);
+	return { width, height };
+}
 
 <* Returns Pixels per logical unit (monitor scale x global UI scale). *>
 fn float Window.get_scale(self) @inline => c::r_window_get_scale((c::Rid)self);
@@ -5018,7 +5597,12 @@ fn void Window.set_user_handle(self, void* handle) @inline => c::r_window_set_us
 fn void* Window.get_user_handle(self) @inline => c::r_window_get_user_handle((c::Rid)self);
 
 <* Fills `native` with the OS handles of the window. *>
-fn CInt Window.get_native_handle(self, NativeWindow* native) @inline => c::r_window_get_native_handle((c::Rid)self, (c::RNativeWindow*)native);
+fn NativeWindow? Window.get_native_handle(self)
+{
+	NativeWindow native;
+	if (!c::r_window_get_native_handle((c::Rid)self, (c::RNativeWindow*)&native)) return last_fault()~;
+	return native;
+}
 
 <*
  Reads back the last rendered frame as tightly packed RGBA8 pixels.
@@ -5027,8 +5611,16 @@ fn CInt Window.get_native_handle(self, NativeWindow* native) @inline => c::r_win
  (R_WINDOW_TRANSPARENT): its pixels are then premultiplied by their
  alpha, as the window system receives them.
  Returns NULL when the backend cannot capture.
+ Release the pixels with Pixels.free().
 *>
-fn char* Window.capture(self, CInt* width, CInt* height) @inline => c::r_window_capture((c::Rid)self, width, height);
+fn Pixels? Window.capture(self)
+{
+	CInt width;
+	CInt height;
+	char* pixels = c::r_window_capture((c::Rid)self, &width, &height);
+	if (!pixels) return last_fault()~;
+	return { .data = pixels, .width = width, .height = height };
+}
 
 <* Widget that has the keyboard focus in the window, or R_INVALID_ID. *>
 fn Widget Window.get_focused_widget(self) @inline => (Widget)c::r_window_get_focused_widget((c::Rid)self);
@@ -5036,7 +5628,14 @@ fn Widget Window.get_focused_widget(self) @inline => (Widget)c::r_window_get_foc
 <* Deepest widget under the cursor, or R_INVALID_ID. *>
 fn Widget Window.get_hovered_widget(self) @inline => (Widget)c::r_window_get_hovered_widget((c::Rid)self);
 
-fn void Window.get_mouse_position(self, float* x, float* y) @inline => c::r_window_get_mouse_position((c::Rid)self, x, y);
+<* Returned as { x, y }. *>
+fn float[<2>] Window.get_mouse_position(self)
+{
+	float x;
+	float y;
+	c::r_window_get_mouse_position((c::Rid)self, &x, &y);
+	return { x, y };
+}
 
 <*
  Inject input as if it came from the OS. Positions are in logical units.
@@ -5061,7 +5660,7 @@ fn void Window.inject_text(self, ZString text) @inline => c::r_window_inject_tex
 fn bool Window.inject_drag(self, float x, float y, bool inside) @inline => c::r_window_inject_drag((c::Rid)self, x, y, (CInt)inside) != 0;
 
 <* Drops files and / or text at a position. Returns R_TRUE when a target took them. *>
-fn CInt Window.inject_drop(self, float x, float y, ZString* paths, CInt path_count, ZString text) @inline => c::r_window_inject_drop((c::Rid)self, x, y, (char**)paths, path_count, (char*)text);
+fn bool Window.inject_drop(self, float x, float y, ZString[] paths, ZString text) @inline => c::r_window_inject_drop((c::Rid)self, x, y, (char**)paths.ptr, (CInt)paths.len, (char*)text) != 0;
 
 <* R_TRUE while the key is held down in the window (cleared when the window loses the keyboard). *>
 fn bool Window.is_key_down(self, Key key) @inline => c::r_window_is_key_down((c::Rid)self, (c::RKey)key) != 0;
@@ -5087,7 +5686,7 @@ fn bool Window.has_popup(self) @inline => c::r_window_has_popup((c::Rid)self) !=
  outputs when there is no visible editable caret, the window is inactive, or focus changed
  since painting. Any output pointer may be NULL.
 *>
-fn CInt Window.get_text_input_rect(self, CInt* x, CInt* y, CInt* width, CInt* height) @inline => c::r_window_get_text_input_rect((c::Rid)self, x, y, width, height);
+fn bool Window.get_text_input_rect(self, CInt* x, CInt* y, CInt* width, CInt* height) @inline => c::r_window_get_text_input_rect((c::Rid)self, x, y, width, height) != 0;
 
 <* Returns Number of open in-window popups (menus, combo lists, pickers), bottom to top. *>
 fn CInt Window.get_popup_count(self) @inline => c::r_window_get_popup_count((c::Rid)self);
@@ -5108,7 +5707,12 @@ fn void Window.unregister_shortcut(self, Key key, Modifier modifiers) @inline =>
 fn void Window.set_touch_settings(self, TouchSettings* settings) @inline => c::r_window_set_touch_settings((c::Rid)self, (c::RTouchSettings*)settings);
 
 <* The settings the window follows (its own, or those of the application). *>
-fn void Window.get_touch_settings(self, TouchSettings* settings) @inline => c::r_window_get_touch_settings((c::Rid)self, (c::RTouchSettings*)settings);
+fn TouchSettings Window.get_touch_settings(self)
+{
+	TouchSettings settings;
+	c::r_window_get_touch_settings((c::Rid)self, (c::RTouchSettings*)&settings);
+	return settings;
+}
 
 <* Fingers on the window now. *>
 fn CInt Window.get_touch_count(self) @inline => c::r_window_get_touch_count((c::Rid)self);
@@ -5192,9 +5796,9 @@ fn bool Window.has_dialog(self) @inline => c::r_window_has_dialog((c::Rid)self) 
  Returns The window, or R_INVALID_ID. Parse errors are reported with
          their line and column through the error callback (R_ERROR_XML).
 *>
-fn Window? window_create_from_xml(ZString xml, usz size)
+fn Window? window_create_from_xml(String xml)
 {
-	Id result = (Id)c::r_window_create_from_xml((char*)xml, size);
+	Id result = (Id)c::r_window_create_from_xml(xml.ptr, xml.len);
 	if (result == INVALID_ID) return last_fault()~;
 	return (Window)result;
 }
@@ -5254,9 +5858,9 @@ typedef Font = inline Id;
  pixel size needed by each window scale, into a shared atlas.
  Returns R_INVALID_ID on failure.
 *>
-fn Font? font_create(ZString data, usz data_size)
+fn Font? font_create(String data)
 {
-	Id result = (Id)c::r_font_create((char*)data, data_size);
+	Id result = (Id)c::r_font_create(data.ptr, data.len);
 	if (result == INVALID_ID) return last_fault()~;
 	return (Font)result;
 }
@@ -5318,9 +5922,9 @@ typedef Texture = inline Id;
  BMP, TGA, GIF, PSD, SVG). Decoding happens on the calling thread.
  Returns R_INVALID_ID on failure.
 *>
-fn Texture? texture_create(ZString data, usz data_size)
+fn Texture? texture_create(String data)
 {
-	Id result = (Id)c::r_texture_create((char*)data, data_size);
+	Id result = (Id)c::r_texture_create(data.ptr, data.len);
 	if (result == INVALID_ID) return last_fault()~;
 	return (Texture)result;
 }
@@ -5330,7 +5934,7 @@ fn Texture? texture_create(ZString data, usz data_size)
  is usable at once; widgets showing it draw nothing until it is ready.
  The buffer is copied.
 *>
-fn Texture texture_create_async(ZString data, usz data_size) @inline => (Texture)c::r_texture_create_async((char*)data, data_size);
+fn Texture texture_create_async(String data) @inline => (Texture)c::r_texture_create_async(data.ptr, data.len);
 
 <*
  Draws an SVG image (an icon) into a texture, at `scale` pixels per
@@ -5397,7 +6001,14 @@ fn void Texture.destroy(self) @inline => c::r_texture_destroy((c::Rid)self);
 
 fn bool Texture.is_valid(self) @inline => c::r_texture_is_valid((c::Rid)self) != 0;
 
-fn void Texture.get_size(self, CInt* width, CInt* height) @inline => c::r_texture_get_size((c::Rid)self, width, height);
+<* Returned as { width, height }. *>
+fn CInt[<2>] Texture.get_size(self)
+{
+	CInt width;
+	CInt height;
+	c::r_texture_get_size((c::Rid)self, &width, &height);
+	return { width, height };
+}
 
 <*
  How the texture is smoothed when it is scaled. The textures made
@@ -5428,9 +6039,9 @@ fn XmlDocument xml_document_create(ZString root_tag) @inline => (XmlDocument)c::
  Reads a text into a document. Comments are kept.
  Returns The document, or R_INVALID_ID.
 *>
-fn XmlDocument? xml_document_parse(ZString xml, usz size, XmlError* error)
+fn XmlDocument? xml_document_parse(String xml, XmlError* error)
 {
-	Id result = (Id)c::r_xml_document_parse((char*)xml, size, (c::RXmlError*)error);
+	Id result = (Id)c::r_xml_document_parse(xml.ptr, xml.len, (c::RXmlError*)error);
 	if (result == INVALID_ID) return last_fault()~;
 	return (XmlDocument)result;
 }
@@ -5516,7 +6127,7 @@ fn Id XmlNode.add_comment(self, ZString text, CInt index) @inline => (Id)c::r_xm
  Reads a piece of XML (one element and what it contains) and
  adds it: what a palette, a paste or a template inserts.
 *>
-fn Id XmlNode.add_xml(self, ZString xml, usz size, CInt index) @inline => (Id)c::r_xml_node_add_xml((c::Rid)self, (char*)xml, size, index);
+fn Id XmlNode.add_xml(self, String xml, CInt index) @inline => (Id)c::r_xml_node_add_xml((c::Rid)self, xml.ptr, xml.len, index);
 
 <* Removes a node and what it contains. The root stays. *>
 fn void XmlNode.remove(self) @inline => c::r_xml_node_remove((c::Rid)self);
@@ -5640,9 +6251,9 @@ typedef Shader = inline Id;
  when the code is not SPIR-V; a backend that refuses it reports an error
  and the effect is drawn as a rectangle.
 *>
-fn Shader? shader_create(void* spirv, usz size, ShaderFlags flags)
+fn Shader? shader_create(char[] spirv, ShaderFlags flags)
 {
-	Id result = (Id)c::r_shader_create(spirv, size, (c::Ruint)flags);
+	Id result = (Id)c::r_shader_create((void*)spirv.ptr, spirv.len, (c::Ruint)flags);
 	if (result == INVALID_ID) return last_fault()~;
 	return (Shader)result;
 }
@@ -5661,11 +6272,13 @@ fn bool Shader.is_valid(self) @inline => c::r_shader_is_valid((c::Rid)self) != 0
 
 fn ShaderFlags Shader.get_flags(self) @inline => (ShaderFlags)c::r_shader_get_flags((c::Rid)self);
 
-<* White to white, no parameter, no texture, square corners, animated when the shader is. *>
-fn void shader_look_init(ShaderLook* look) @inline => c::r_shader_look_init((c::RShaderLook*)look);
-
 <* Fills a look with the defaults of the shader when it is a built-in effect (else Rshader_look_init). *>
-fn void Shader.look_defaults(self, ShaderLook* look) @inline => c::r_shader_look_defaults((c::Rid)self, (c::RShaderLook*)look);
+fn ShaderLook Shader.look_defaults(self)
+{
+	ShaderLook look;
+	c::r_shader_look_defaults((c::Rid)self, (c::RShaderLook*)&look);
+	return look;
+}
 
 // ---- the other widget types
 
@@ -5776,7 +6389,7 @@ fn ZString get_version() @inline => (ZString)c::r_get_version();
  other function that allocates. The functions are called from several
  threads; alloc must return memory aligned for any type (16 bytes).
 *>
-fn void set_allocator(Allocator* allocator) @inline => c::r_set_allocator((c::RAllocator*)allocator);
+fn void set_allocator(MemoryAllocator* allocator) @inline => c::r_set_allocator((c::RAllocator*)allocator);
 
 <*
  Returns An allocator that forwards to malloc, realloc and free of the C
@@ -5785,7 +6398,7 @@ fn void set_allocator(Allocator* allocator) @inline => c::r_set_allocator((c::RA
  The environment variable RAVEN_ALLOCATOR=system does the same without
  recompiling, and it is the default in a build with AddressSanitizer.
 *>
-fn Allocator* allocator_get_system() @inline => (Allocator*)c::r_allocator_get_system();
+fn MemoryAllocator* allocator_get_system() @inline => (MemoryAllocator*)c::r_allocator_get_system();
 
 <*
  Memory from the allocator of Raven (or from the one given to
@@ -5802,7 +6415,12 @@ alias memory_realloc = c::r_memory_realloc;
 alias memory_free = c::r_memory_free;
 
 <* What the library holds right now. Thread-safe. *>
-fn void memory_get_stats(MemoryStats* stats) @inline => c::r_memory_get_stats((c::RMemoryStats*)stats);
+fn MemoryStats memory_get_stats()
+{
+	MemoryStats stats;
+	c::r_memory_get_stats((c::RMemoryStats*)&stats);
+	return stats;
+}
 
 <*
  Walks the whole heap of Raven and verifies its structure.
@@ -6016,7 +6634,7 @@ fn void set_device_reset_callback(DeviceResetCallback callback, void* user_data)
 fn bool drag_begin(Id source, ZString type, ZString data, ZString label) @inline => c::r_drag_begin((c::Rid)source, (char*)type, (char*)data, (char*)label) != 0;
 
 <* R_TRUE while a drag started by Rdrag_begin is in progress in the window. *>
-fn CInt drag_is_active(Id window) @inline => c::r_drag_is_active((c::Rid)window);
+fn bool drag_is_active(Id window) @inline => c::r_drag_is_active((c::Rid)window) != 0;
 
 <* Type of the drag in progress, or NULL. *>
 fn ZString drag_get_type(Id window) @inline => (ZString)c::r_drag_get_type((c::Rid)window);
@@ -6028,13 +6646,23 @@ fn ZString drag_get_data(Id window) @inline => (ZString)c::r_drag_get_data((c::R
 fn void drag_cancel(Id window) @inline => c::r_drag_cancel((c::Rid)window);
 
 <* The settings every window follows, unless it has its own. *>
-fn void touch_get_settings(TouchSettings* settings) @inline => c::r_touch_get_settings((c::RTouchSettings*)settings);
+fn TouchSettings touch_get_settings()
+{
+	TouchSettings settings;
+	c::r_touch_get_settings((c::RTouchSettings*)&settings);
+	return settings;
+}
 
 <* Changes them; NULL puts back the defaults. *>
 fn void touch_set_settings(TouchSettings* settings) @inline => c::r_touch_set_settings((c::RTouchSettings*)settings);
 
 <* The defaults, to start from. *>
-fn void touch_get_default_settings(TouchSettings* settings) @inline => c::r_touch_get_default_settings((c::RTouchSettings*)settings);
+fn TouchSettings touch_get_default_settings()
+{
+	TouchSettings settings;
+	c::r_touch_get_default_settings((c::RTouchSettings*)&settings);
+	return settings;
+}
 
 <*
  Changes the look of the application. The theme file in use, if
@@ -6131,7 +6759,7 @@ alias theme_clear_styles = c::r_theme_clear_styles;
 fn ZString theme_load(ZString path) @inline => (ZString)c::r_theme_load((char*)path);
 
 <* Same, from a text. `size` may be 0 for a null-terminated text. *>
-fn ZString theme_load_from_memory(ZString xml, usz size) @inline => (ZString)c::r_theme_load_from_memory((char*)xml, size);
+fn ZString theme_load_from_memory(String xml) @inline => (ZString)c::r_theme_load_from_memory(xml.ptr, xml.len);
 
 <*
  Makes a named theme the theme of the application: a theme
@@ -6178,7 +6806,12 @@ fn Direction get_layout_direction() @inline => (Direction)c::r_get_layout_direct
 fn CInt language_register(LanguageDesc* desc) @inline => c::r_language_register((c::RLanguageDesc*)desc);
 
 <* Reads the description of a language. The strings belong to the library. Returns R_FALSE when it is unknown. *>
-fn CInt language_get(ZString name, LanguageDesc* desc) @inline => c::r_language_get((char*)name, (c::RLanguageDesc*)desc);
+fn LanguageDesc? language_get(ZString name)
+{
+	LanguageDesc desc;
+	if (!c::r_language_get((char*)name, (c::RLanguageDesc*)&desc)) return last_fault()~;
+	return desc;
+}
 
 alias language_get_count = c::r_language_get_count;
 
@@ -6215,7 +6848,7 @@ fn CInt taskbar_set_badge(ZString text) @inline => c::r_taskbar_set_badge((char*
  and what changes in it shows the next time the menu opens.
  R_INVALID_ID: none. R_FALSE where the system has no such menu.
 *>
-fn CInt taskbar_set_menu(Id menu) @inline => c::r_taskbar_set_menu((c::Rid)menu);
+fn bool taskbar_set_menu(Id menu) @inline => c::r_taskbar_set_menu((c::Rid)menu) != 0;
 
 <*
  The tasks of the jump list of Windows (right click on the button
@@ -6224,7 +6857,7 @@ fn CInt taskbar_set_menu(Id menu) @inline => c::r_taskbar_set_menu((c::Rid)menu)
  application reads them as any other command line. count 0: none.
  R_FALSE where there is no jump list.
 *>
-fn CInt taskbar_set_jump_list(JumpTask* tasks, CInt count) @inline => c::r_taskbar_set_jump_list((c::RJumpTask*)tasks, count);
+fn bool taskbar_set_jump_list(JumpTask[] tasks) @inline => c::r_taskbar_set_jump_list((c::RJumpTask*)tasks.ptr, (CInt)tasks.len) != 0;
 
 <* Red, green, blue (0..1) to hue (0..360), saturation, value (0..1). *>
 alias color_rgb_to_hsv = c::r_color_rgb_to_hsv;
@@ -6296,27 +6929,41 @@ fn ZString file_dialog_get_result(CInt index) @inline => (ZString)c::r_file_dial
  and '\\' alike. Memory files are not watched for live reload. Call it
  after Rinit; Rshutdown forgets every file.
 *>
-fn CInt file_register_memory(ZString path, void* data, usz size, bool copy) @inline => c::r_file_register_memory((char*)path, data, size, (CInt)copy);
+fn void? file_register_memory(ZString path, char[] data, bool copy)
+{
+	if (!c::r_file_register_memory((char*)path, (void*)data.ptr, data.len, (CInt)copy)) return last_fault()~;
+}
 
 fn void file_unregister_memory(ZString path) @inline => c::r_file_unregister_memory((char*)path);
 
 <* R_TRUE when `path` is a file registered with Rfile_register_memory. *>
-fn CInt file_is_memory(ZString path) @inline => c::r_file_is_memory((char*)path);
+fn bool file_is_memory(ZString path) @inline => c::r_file_is_memory((char*)path) != 0;
 
 <*
  Whole files, with UTF-8 paths on every platform.
  Returns Rfile_read: the content followed by a '\0', to release with
  Rmemory_free; NULL when the file cannot be read. `size` may be NULL.
+ The bytes are a copy made with `allocator`: free them with it.
 *>
-fn ZString file_read(ZString path, usz* size) @inline => (ZString)c::r_file_read((char*)path, size);
+fn char[]? file_read(ZString path, Allocator allocator = mem)
+{
+	usz size;
+	char* data = c::r_file_read((char*)path, &size);
+	if (!data) return last_fault()~;
+	defer c::r_memory_free(data);
+	return alloc::clone_slice(allocator, data[:size]);
+}
 
-fn CInt file_write(ZString path, void* data, usz size) @inline => c::r_file_write((char*)path, data, size);
+fn void? file_write(ZString path, char[] data)
+{
+	if (!c::r_file_write((char*)path, (void*)data.ptr, data.len)) return last_fault()~;
+}
 
 <* Returns R_TRUE when the system took the notification. *>
 fn bool notification_show(ZString title, ZString body, NotificationUrgency urgency) @inline => c::r_notification_show((char*)title, (char*)body, (c::RNotificationUrgency)urgency) != 0;
 
 <* R_FALSE when the platform has no notifications (Rnotification_show then always uses the fallback). *>
-alias notification_is_supported = c::r_notification_is_supported;
+fn bool notification_is_supported() @inline => c::r_notification_is_supported() != 0;
 
 <* Called with the notifications the system could not show; NULL: none. *>
 fn void notification_set_fallback(NotificationFallback callback, void* user_data) @inline => c::r_notification_set_fallback((c::RNotificationFallback)callback, user_data);
@@ -6330,12 +6977,6 @@ fn void notification_set_fallback(NotificationFallback callback, void* user_data
 *>
 fn void notification_set_clicked_callback(NotificationClickedCallback callback, void* user_data) @inline => c::r_notification_set_clicked_callback((c::RNotificationClickedCallback)callback, user_data);
 
-<* Pushes a spring away from its target (units per second): it bounces back. *>
-fn void spring_kick(Spring* spring, float velocity) @inline => c::r_spring_kick((c::RSpring*)spring, velocity);
-
-<* Puts a spring at rest on a value, without animation. *>
-fn void spring_set(Spring* spring, float value) @inline => c::r_spring_set((c::RSpring*)spring, value);
-
 <* A built-in effect, created the first time it is asked for. *>
 fn Id effect_get(Effect effect) @inline => (Id)c::r_effect_get((c::REffect)effect);
 
@@ -6345,7 +6986,12 @@ fn Id effect_find(ZString name) @inline => (Id)c::r_effect_find((char*)name);
 fn ZString effect_get_name(Effect effect) @inline => (ZString)c::r_effect_get_name((c::REffect)effect);
 
 <* Its colors and parameters when nothing else is given (Rshader_look_init uses them). *>
-fn void effect_get_defaults(Effect effect, ShaderLook* look) @inline => c::r_effect_get_defaults((c::REffect)effect, (c::RShaderLook*)look);
+fn ShaderLook effect_get_defaults(Effect effect)
+{
+	ShaderLook look;
+	c::r_effect_get_defaults((c::REffect)effect, (c::RShaderLook*)&look);
+	return look;
+}
 
 <*
  A folder looked into after the one of the document (see above),
@@ -6387,7 +7033,7 @@ alias xml_check_files = c::r_xml_check_files;
  declare can be used in the documents loaded afterwards.
  Returns The number of tags declared.
 *>
-fn CInt xml_register_widgets(ZString xml, usz size) @inline => c::r_xml_register_widgets((char*)xml, size);
+fn CInt xml_register_widgets(String xml) @inline => c::r_xml_register_widgets(xml.ptr, xml.len);
 
 fn CInt xml_register_widgets_from_file(ZString path) @inline => c::r_xml_register_widgets_from_file((char*)path);
 
@@ -6443,13 +7089,18 @@ fn CInt xml_get_tag_children(ZString tag) @inline => c::r_xml_get_tag_children((
 *>
 fn CInt xml_get_attribute_count(ZString tag) @inline => c::r_xml_get_attribute_count((char*)tag);
 
-fn CInt xml_get_attribute_info(ZString tag, CInt index, XmlAttributeInfo* info) @inline => c::r_xml_get_attribute_info((char*)tag, index, (c::RXmlAttributeInfo*)info);
+fn XmlAttributeInfo? xml_get_attribute_info(ZString tag, CInt index)
+{
+	XmlAttributeInfo info;
+	if (!c::r_xml_get_attribute_info((char*)tag, index, (c::RXmlAttributeInfo*)&info)) return last_fault()~;
+	return info;
+}
 
 <* Loads a CSV table of translations from a file. Returns the number of keys read, -1 on an error. *>
 fn CInt locale_load_csv(ZString path) @inline => c::r_locale_load_csv((char*)path);
 
 <* Same, from text in memory (UTF-8). *>
-fn CInt locale_load_csv_from_memory(ZString csv, usz size) @inline => c::r_locale_load_csv_from_memory((char*)csv, size);
+fn CInt locale_load_csv_from_memory(String csv) @inline => c::r_locale_load_csv_from_memory(csv.ptr, csv.len);
 
 <* Forgets every table. *>
 alias locale_clear = c::r_locale_clear;
@@ -6470,7 +7121,7 @@ fn ZString locale_get_language_at(CInt index) @inline => (ZString)c::r_locale_ge
  see Rset_layout_direction). Returns R_FALSE when no column matches (the
  language is set all the same: the texts fall back).
 *>
-fn CInt locale_set_language(ZString code) @inline => c::r_locale_set_language((char*)code);
+fn bool locale_set_language(ZString code) @inline => c::r_locale_set_language((char*)code) != 0;
 
 fn ZString locale_get_language() @inline => (ZString)c::r_locale_get_language();
 
@@ -6481,7 +7132,7 @@ fn ZString locale_get_system_language() @inline => (ZString)c::r_locale_get_syst
 fn void locale_set_fallback_language(ZString code) @inline => c::r_locale_set_fallback_language((char*)code);
 
 <* R_TRUE when the language is written from right to left. *>
-alias locale_is_rtl = c::r_locale_is_rtl;
+fn bool locale_is_rtl() @inline => c::r_locale_is_rtl() != 0;
 
 <* Called after the language or the tables changed (the widgets are already updated). *>
 fn void locale_set_changed_callback(LocaleChangedCallback callback, void* user_data) @inline => c::r_locale_set_changed_callback((c::RLocaleChangedCallback)callback, user_data);
@@ -6490,13 +7141,13 @@ fn void locale_set_changed_callback(LocaleChangedCallback callback, void* user_d
 fn ZString tr(ZString key) @inline => (ZString)c::r_tr((char*)key);
 
 <* R_TRUE when the key has a text in the current language or the fallback one. *>
-fn CInt tr_exists(ZString key) @inline => c::r_tr_exists((char*)key);
+fn bool tr_exists(ZString key) @inline => c::r_tr_exists((char*)key) != 0;
 
 <*
  The text of a key with its {0} {1} ... replaced by the arguments
  (translators may put them in any order). "{{" is a brace.
 *>
-fn ZString tr_format(ZString key, ZString* args, CInt arg_count) @inline => (ZString)c::r_tr_format((char*)key, (char**)args, arg_count);
+fn ZString tr_format(ZString key, ZString[] args) @inline => (ZString)c::r_tr_format((char*)key, (char**)args.ptr, (CInt)args.len);
 
 <*
  The plural form of a key for a count: the key followed by the CLDR
@@ -6543,7 +7194,12 @@ fn void accessibility_set_color_filter(ColorFilter filter) @inline => c::r_acces
 
 fn ColorFilter accessibility_get_color_filter() @inline => (ColorFilter)c::r_accessibility_get_color_filter();
 
-fn void accessibility_get_system_settings(AccessibilitySettings* settings) @inline => c::r_accessibility_get_system_settings((c::RAccessibilitySettings*)settings);
+fn AccessibilitySettings accessibility_get_system_settings()
+{
+	AccessibilitySettings settings;
+	c::r_accessibility_get_system_settings((c::RAccessibilitySettings*)&settings);
+	return settings;
+}
 
 <* Applies the settings of the system (text size, contrast, motion). *>
 alias accessibility_follow_system = c::r_accessibility_follow_system;
@@ -6552,7 +7208,7 @@ alias accessibility_follow_system = c::r_accessibility_follow_system;
 fn void accessibility_announce(ZString text, CInt assertive) @inline => c::r_accessibility_announce((char*)text, assertive);
 
 <* R_TRUE when a screen reader is reading the windows of the application. *>
-alias accessibility_is_screen_reader_active = c::r_accessibility_is_screen_reader_active;
+fn bool accessibility_is_screen_reader_active() @inline => c::r_accessibility_is_screen_reader_active() != 0;
 
 <* Makes the next Rinit use the host platform. The structure is copied; NULL restores the default. *>
 fn void host_platform_register(HostPlatformDesc* desc) @inline => c::r_host_platform_register((c::RHostPlatformDesc*)desc);
@@ -6582,3 +7238,146 @@ fn void host_inject_focus(Id window, CInt focused) @inline => c::r_host_inject_f
 
 <* The user asked to close the window (its close callback decides). *>
 fn void host_inject_close(Id window) @inline => c::r_host_inject_close((c::Rid)window);
+
+<*
+ By default Raven creates its own VkInstance and VkDevice. To make Raven render
+ with the device of the application (or of HRL), create the instance and the
+ device with the extensions returned below, then pass them here.
+ The texts belong to the library.
+*>
+fn ZString[] vulkan_get_required_instance_extensions()
+{
+	uint count;
+	return ((ZString*)c::r_vulkan_get_required_instance_extensions(&count))[:count];
+}
+
+<* The texts belong to the library. *>
+fn ZString[] vulkan_get_required_device_extensions()
+{
+	uint count;
+	return ((ZString*)c::r_vulkan_get_required_device_extensions(&count))[:count];
+}
+
+<* Makes Raven use an existing device. Raven does not destroy these objects. *>
+alias vulkan_set_external_device = c::r_vulkan_set_external_device;
+
+fn void vulkan_set_queue_lock_callbacks(VulkanQueueLockCallback lock, VulkanQueueLockCallback unlock, void* user_data) @inline => c::r_vulkan_set_queue_lock_callbacks((c::RVulkanQueueLockCallback)lock, (c::RVulkanQueueLockCallback)unlock, user_data);
+
+<* Opaque VkInstance, or NULL before initialization / on another backend. *>
+alias vulkan_get_instance = c::r_vulkan_get_instance;
+
+<* Opaque VkPhysicalDevice. *>
+alias vulkan_get_physical_device = c::r_vulkan_get_physical_device;
+
+<* Opaque VkDevice. *>
+alias vulkan_get_device = c::r_vulkan_get_device;
+
+<* Opaque VkQueue used for rendering and presentation. *>
+alias vulkan_get_graphics_queue = c::r_vulkan_get_graphics_queue;
+
+alias vulkan_get_graphics_queue_family = c::r_vulkan_get_graphics_queue_family;
+
+<*
+ Behaves as if the GPU had answered VK_ERROR_DEVICE_LOST, to test
+ how an application recovers (Rset_device_reset_callback). Raven
+ recovers at the next frame by making a new device: every handle
+ returned above changes. Does nothing with an external device
+ (Rvulkan_set_external_device), whose loss the application handles.
+*>
+alias vulkan_simulate_device_lost = c::r_vulkan_simulate_device_lost;
+
+<*
+ Wraps an application image so that widgets (Image, Viewport) can show it.
+ The image must be in VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL whenever Raven
+ renders, and must outlive the texture. Raven does not destroy it: destroy it
+ after Rtexture_destroy, which returns once Raven no longer uses the image.
+
+ The values of the image are shown as they are (the UI is not color
+ managed): use a UNORM view of an sRGB-encoded image. Alpha is honored, so
+ clear the image with alpha 1 unless the viewport should be see-through.
+*>
+fn Texture vulkan_texture_create_from_image_view(ulong image_view, ulong sampler, CInt width, CInt height) @inline => (Texture)c::r_vulkan_texture_create_from_image_view(image_view, sampler, width, height);
+
+<*
+ Points an existing wrapped texture to another image view (after a resize).
+ Returns once Raven no longer uses the previous view, which can then be destroyed.
+*>
+fn void vulkan_texture_set_image_view(Id texture, ulong image_view, ulong sampler, CInt width, CInt height) @inline => c::r_vulkan_texture_set_image_view((c::Rid)texture, image_view, sampler, width, height);
+
+<*
+ Creates an RGBA8 texture whose memory can be imported by another
+ API or process (OpenGL GL_EXT_memory_object, another Vulkan device).
+ Requires VK_KHR_external_memory_fd (POSIX) or _win32 (Windows).
+ Returns R_INVALID_ID when the device cannot export memory.
+*>
+fn Texture? vulkan_texture_create_shared(CInt width, CInt height)
+{
+	Id result = (Id)c::r_vulkan_texture_create_shared(width, height);
+	if (result == INVALID_ID) return last_fault()~;
+	return (Texture)result;
+}
+
+<* Exports the memory of a shared texture. Each call returns a new handle. *>
+fn SharedTextureInfo? vulkan_texture_get_shared_info(Id texture)
+{
+	SharedTextureInfo info;
+	if (!c::r_vulkan_texture_get_shared_info((c::Rid)texture, (c::RSharedTextureInfo*)&info)) return last_fault()~;
+	return info;
+}
+
+<*
+ Supplies the backend used by Rinit(R_BACKEND_CUSTOM).
+ The table is copied. Must be called before Rinit.
+*>
+fn void backend_register(BackendVTable* vtable) @inline => c::r_backend_register((c::RBackendVTable*)vtable);
+
+<*
+ Tells Raven that the device of the backend was lost. Thread-safe:
+ call it from the backend (render thread) when the API reports it. At the
+ next frame Raven calls Shutdown and Init again, then remakes the
+ surfaces, the textures and the shaders (see Rset_device_reset_callback).
+ Until then RenderFrame may simply return.
+*>
+alias backend_device_lost = c::r_backend_device_lost;
+
+<* Allocates a pixel buffer released by Rpixels_free. Thread-safe. *>
+alias pixels_alloc = c::r_pixels_alloc;
+
+<*
+ Returns R_TRUE when a browser that can be driven was found: the one
+ given to Rweb_set_browser_path, else the one named by the environment
+ variable RAVEN_WEB_BROWSER, else one found where they are usually
+ installed. Without one, web views show a message instead of pages.
+*>
+fn bool web_is_available() @inline => c::r_web_is_available() != 0;
+
+<* Path of the browser program to use (NULL: look for one). To call before the first view is created. *>
+fn void web_set_browser_path(ZString path) @inline => c::r_web_set_browser_path((char*)path);
+
+<* Returns The browser that is (or would be) used, or "" when there is none. *>
+fn ZString web_get_browser_path() @inline => (ZString)c::r_web_get_browser_path();
+
+<*
+ Folder where the browser keeps its profile (cookies, storage,
+ cache). By default a temporary folder, deleted when the browser
+ stops: nothing is remembered from one run to the next. To call before
+ the first view is created.
+*>
+fn void web_set_profile_folder(ZString path) @inline => c::r_web_set_profile_folder((char*)path);
+
+<*
+ More arguments for the command line of the browser, separated
+ by spaces (e.g. "--proxy-server=localhost:8080"). Without a call to
+ this function, those of the environment variable RAVEN_WEB_ARGUMENTS.
+*>
+fn void web_set_browser_arguments(ZString arguments) @inline => c::r_web_set_browser_arguments((char*)arguments);
+
+<* Makes the tag <WebView> known to the XML loader. To call once after Rinit. *>
+alias web_register_xml = c::r_web_register_xml;
+
+<*
+ Stops the browser now and forgets every setting. The views
+ that remain show their last picture. Rshutdown deletes the views, and
+ that stops the browser too: this is only for stopping it earlier.
+*>
+alias web_shutdown = c::r_web_shutdown;

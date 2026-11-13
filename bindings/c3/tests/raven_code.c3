@@ -55,23 +55,38 @@ fn int main(String[] args)
 	ok &= expect(box.get_type() == WidgetType.VBOX, "Widget.get_type");
 	ok &= expect(box.get_child_count() == 2, "Widget.get_child_count");
 	ok &= expect(quit.get_type() == WidgetType.BUTTON, "button_create");
-	CInt width;
-	CInt height;
-	window.get_size(&width, &height);
-	ok &= expect(width == 420 && height == 220, "Window.get_size");
-	float x;
-	float y;
-	float w;
-	float h;
-	quit.get_rect(&x, &y, &w, &h);
-	ok &= expect(w > 0 && h > 0, "Widget.get_rect");
-	window.inject_mouse_move(x + w / 2, y + h / 2);
+	// what C fills through pointers is returned, as a vector
+	CInt[<2>] size = window.get_size();
+	ok &= expect(size == { 420, 220 }, "Window.get_size");
+	float[<4>] rect = quit.get_rect();         // { x, y, width, height }
+	ok &= expect(rect.z > 0 && rect.w > 0, "Widget.get_rect");
+	window.inject_mouse_move(rect.x + rect.z / 2, rect.y + rect.w / 2);
 	window.inject_mouse_button(MouseButton.LEFT, true);
 	window.inject_mouse_button(MouseButton.LEFT, false);
 	ok &= expect(!raven::is_running(), "the Quit button");
 	// an error of Raven is a fault: a file that does not exist
 	fault missing = @catch(raven::window_create_from_xml_file("no such file.xml"));
 	ok &= expect(missing == raven::ERROR_FILE_NOT_FOUND, "a fault for a missing file");
+	// a slice for a pointer and its size, and memory of Raven copied with an Allocator
+	char[] text = "file in memory";
+	ok &= expect(@ok(raven::file_register_memory("memory.txt", text, true)), "file_register_memory");
+	if (try char[] read = raven::file_read("memory.txt"))
+	{
+		ok &= expect(read == text, "file_read");
+		free(read);
+	}
+	else
+	{
+		ok &= expect(false, "file_read");
+	}
+	// a structure C fills, returned
+	MemoryStats stats = raven::memory_get_stats();
+	ok &= expect(stats.allocation_count > 0, "memory_get_stats");
+	// the functions of a structure are its methods
+	Spring spring;
+	spring.set(2.0);
+	ok &= expect(spring.value == 2.0, "Spring.set");
+	ok &= expect(window.index() == ((uint)window & 0xFFFFF), "Id.index");
 	CInt code = raven::get_exit_code();
 	raven::shutdown();
 	if (!ok) return 1;

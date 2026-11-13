@@ -4,8 +4,8 @@
 Based on gen_cpp.py of Raven's tools/bindgen, and written against the same
 reader of the headers (cparse.py). It can be used two ways:
 
-  - as one more generator of Raven's bindgen: copy it next to bindgen.py and
-    add "c3" to the list of languages there; it writes bindings/c3/raven.c3l/src/;
+  - as one more generator of Raven's bindgen (python tools/bindgen/bindgen.py c3);
+    it writes bindings/c3/raven.c3l/src/;
   - on its own:
 
         python tools/bindgen/gen_c3.py                  clones Raven, writes bindings/c3/raven.c3l/src
@@ -16,11 +16,18 @@ reader of the headers (cparse.py). It can be used two ways:
 
 It writes two files:
 
-  raven_c.c3   module raven::c   the C API as it is, as `extern fn`, under
-                                 snake_case names (Rbutton_set_text is
-                                 c::button_set_text, @cname keeps the symbol)
+  raven_c.c3   module raven::c   the whole C API as it is, 1:1: every type,
+                                 constant and function of the headers, the
+                                 functions as `extern fn` bound by @cname,
+                                 named in snake_case as C3 wants them (Rinit
+                                 is r_init, Rbutton_set_text r_button_set_text)
   raven.c3     module raven      the C3 API: types, constants, faults, typed
-                                 handles with methods, and the free functions
+                                 handles with methods, Optionals, slices,
+                                 vectors, and memory released the C3 way
+
+cparse.py leaves out the headers that "only make sense from C" (Vulkan,
+backends): the C3 binding reads them too, and raven_web.h, whose functions are
+part of the same library, so that raven::c is the whole library.
 """
 
 import argparse
@@ -33,6 +40,11 @@ import tempfile
 
 RAVEN_REPOSITORY = "https://github.com/oscar-soirey/Raven"
 
+# Headers read on top of the ones cparse.py reads (paths from the root of Raven).
+# raven_emscripten.h is not one of them: it only exists in the WebAssembly build.
+EXTRA_HEADERS = ["include/raven/raven_vulkan.h", "include/raven/raven_backend.h", "web/include/raven_web.h"]
+NOT_BOUND_HEADERS = ("raven_emscripten.h",)
+
 # ---------------------------------------------------------------------------
 # What becomes a type with methods (as the classes of gen_cpp.py)
 # ---------------------------------------------------------------------------
@@ -43,7 +55,7 @@ WIDGET_PREFIXES = [
     "label", "button", "checkbox", "slider", "progress_bar", "image", "text_input", "spin_box", "combo_box", "separator",
     "list_view", "tree_view", "menu_item", "menu", "panel", "uniform_grid", "grid", "border", "size_box", "spacer", "scroll_box",
     "splitter", "switcher", "tab_view", "expander", "text_editor", "header_bar", "dock_area", "island", "file_browser",
-    "viewport", "custom",
+    "viewport", "custom", "web_view",
 ]
 # R_WIDGET_X whose prefix is not the one of the C functions
 WIDGET_TYPE_ALIASES = {"progressbar": "progress_bar"}
@@ -51,6 +63,12 @@ WIDGET_TYPE_ALIASES = {"progressbar": "progress_bar"}
 WIDGET_TYPE_CLASS = {"vbox": "panel", "hbox": "panel", "wrap_box": "panel"}
 # handles that are not widgets
 HANDLE_PREFIXES = ["window", "tree_item", "font", "texture", "timer", "xml_document", "xml_node", "tray", "shader"]
+# free functions returning a handle whose type their name does not tell
+RETURN_CLASS = {"Rvulkan_texture_create_from_image_view": "Texture", "Rvulkan_texture_create_shared": "Texture"}
+
+# C names whose C3 name would hide a type of the standard library of C3
+# (std::core is always imported: `Allocator a = mem;` must keep working)
+TYPE_RENAMES = {"RAllocator": "MemoryAllocator"}
 
 # ---------------------------------------------------------------------------
 # Error handling: which functions report a failure, turned into an Optional
@@ -60,7 +78,7 @@ HANDLE_PREFIXES = ["window", "tree_item", "font", "texture", "timer", "xml_docum
 FALLIBLE_BOOL = {
     "Rinit", "Rinit_ex", "Ropen_url", "Rwindow_set_theme", "Rtheme_use", "Rwidget_set_theme", "Rdock_area_load_layout",
     "Rcolor_picker_set_hex", "Rtimeline_set_track_style", "Rnode_graph_set_node_style", "Rfile_browser_set_directory",
-    "Rviewport_set_native", "Rxml_register_tag", "Rxml_node_move",
+    "Rviewport_set_native", "Rxml_register_tag", "Rxml_node_move", "Rfile_write", "Rfile_register_memory",
 }
 # Rid functions where R_INVALID_ID is a failure: Type? in C3. Also every
 # create/load/parse function whose documentation says it returns R_INVALID_ID
@@ -79,6 +97,33 @@ BOOL_PARAMS = {
 # int functions that answer yes or no: bool in C3
 BOOL_RETURN_PREFIX = ("is_", "has_", "can_", "wants_", "was_", "contains_")
 BOOL_RETURNS = {"Rwait_frame", "Rdraw_frame"}
+
+# a parameter giving the length of the pointers before it: they become one slice each
+LENGTH_PARAM = re.compile(r"^(count|size|data_size|\w+_count)$")
+# kinds of parameters (cparse.classify) read as arrays
+ARRAY_KINDS = ("carray", "cbytes", "cptr", "cstr_array", "cstruct_ptr")
+
+# ---------------------------------------------------------------------------
+# Macros of the headers (#define with parameters), written in C3
+# ---------------------------------------------------------------------------
+
+# name -> the C3 macro of raven::c. A new macro in the headers is reported.
+C_MACROS = {
+    "R_ID_INDEX": ["macro Ruint r_id_index(Rid id) => id & 0xFFFFF;"],
+    "Rerror_check": [
+        "macro void r_error_check()",
+        "{",
+        "\tchar* detail = null;",
+        "\tRSeverity severity = R_SEVERITY_WEAK_WARNING;",
+        "\tRError error = r_error_get_last(&detail, &severity);",
+        "\tif (error != R_NO_ERROR)",
+        "\t{",
+        "\t\tio::printfn(\"[Raven] %s | %s | %s | %s:%d\", (ZString)r_error_to_string(error),",
+        "\t\t\t(ZString)r_severity_to_string(severity), detail ? (ZString)detail : (ZString)\"\", $$FILE, $$LINE);",
+        "\t}",
+        "}",
+    ],
+}
 
 # ---------------------------------------------------------------------------
 # Names
@@ -103,21 +148,38 @@ def safe(name):
     return name + "_" if name in KEYWORDS else name
 
 
+def snake_ident(name):
+    """CreateSurface -> create_surface (C3 wants members and parameters in snake_case)."""
+    return re.sub(r"(?<=[a-z0-9])([A-Z])", r"_\1", name).lower()
+
+
+def ident(name):
+    """The name of a parameter or a member in C3."""
+    return safe(snake_ident(name))
+
+
 def pascal(prefix):
     return "".join(part.capitalize() for part in prefix.split("_"))
 
 
 def type_name(cname):
     """RWidgetType -> WidgetType"""
+    if cname in TYPE_RENAMES:
+        return TYPE_RENAMES[cname]
     return cname[1:] if cname.startswith("R") and cname[1:2].isupper() else cname
 
 
+def type_snake(name):
+    """ShaderLook -> shader_look"""
+    return "_".join(w.lower() for w in re.findall(r"[A-Z][a-z0-9]*", name))
+
+
 def c_function(function_name):
-    """The name of a C function in raven::c: as it is, but a C3 function cannot
-    start with a capital: Rinit is r_init, Rbutton_set_text r_button_set_text."""
+    """The name of a C function in raven::c: in snake_case, since a C3 function
+    cannot start with a capital: Rinit is r_init, Rbutton_set_text r_button_set_text."""
     if function_name[:1].isupper():
-        return function_name[0].lower() + "_" + function_name[1:]
-    return function_name
+        return function_name[0].lower() + "_" + snake_ident(function_name[1:])
+    return snake_ident(function_name)
 
 
 def snake(function_name):
@@ -206,9 +268,11 @@ def doc_text(doc):
     return lines
 
 
-def doc_block(doc, indent=""):
-    """A C3 documentation comment, <* ... *>, from one of the headers."""
+def doc_block(doc, indent="", extra=None):
+    """A C3 documentation comment, <* ... *>, from one of the headers (and `extra`, a line of the binding)."""
     lines = doc_text(doc)
+    if extra:
+        lines = lines + [extra]
     if not lines:
         return []
     if len(lines) == 1:
@@ -218,15 +282,163 @@ def doc_block(doc, indent=""):
 
 # the C types as they are, for raven::c
 C_BASE = {"int": "CInt", "float": "float", "double": "double", "char": "char", "size_t": "usz", "uint64_t": "ulong",
-          "uintptr_t": "uptr", "uint32_t": "uint", "uint8_t": "char", "void": "void"}
+          "uintptr_t": "uptr", "intptr_t": "iptr", "uint32_t": "uint", "uint8_t": "char", "void": "void"}
+
+
+# ---------------------------------------------------------------------------
+# The headers: those cparse.py skips, and what it leaves out of the others
+# ---------------------------------------------------------------------------
+
+def default_root():
+    return os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+
+def header_paths(root):
+    """Every header of the library the binding covers, in the order of Raven.h."""
+    include = os.path.join(root, "include")
+    order = re.findall(r'#include "raven/(\w+\.h)"', open(os.path.join(include, "Raven.h"), encoding="utf-8").read())
+    paths = [os.path.join(include, "raven", h) for h in order if h not in NOT_BOUND_HEADERS]
+    for rel in EXTRA_HEADERS:
+        path = os.path.join(root, *rel.split("/"))
+        if os.path.exists(path) and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def known_values(api):
+    known = {n: v for n, k, v in api.defines if k != "str"}
+    for e in api.enums:
+        for item, value, _ in e.items:
+            known[item] = value
+    return known
+
+
+def full_api(api, root):
+    """
+    A copy of `api` with the headers cparse.py leaves out (EXTRA_HEADERS).
+    `api` itself is shared with the other generators of bindgen.py and stays
+    as it is.
+    """
+    import cparse
+    full = cparse.Api()
+    full.enums, full.structs, full.opaque = list(api.enums), list(api.structs), list(api.opaque)
+    full.callbacks, full.functions, full.defines = list(api.callbacks), list(api.functions), list(api.defines)
+    full.version = api.version
+    parsed = {f.header for f in api.functions}
+    known = known_values(api)
+    work = tempfile.mkdtemp(prefix="gen_c3-")
+    try:
+        for rel in EXTRA_HEADERS:
+            path = os.path.join(root, *rel.split("/"))
+            if not os.path.exists(path) or os.path.basename(path) in parsed:
+                continue
+            # raven_web.h names RAVEN_API RAVEN_WEB_API ("part of the Raven library itself")
+            text = open(path, encoding="utf-8").read().replace("RAVEN_WEB_API", "RAVEN_API")
+            copy = os.path.join(work, os.path.basename(path))
+            with open(copy, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            cparse.parse_header(copy, full, known)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return full
+
+
+class Scan:
+    def __init__(self):
+        self.marks = {}         # enum -> [(R_WIDGET_LAST_, value)]: the end marks cparse drops
+        self.constants = []     # [(name, value, doc)]: defines computed from the marks (R_COLOR_COUNT)
+        self.macros = {}        # name -> doc: the defines with parameters
+        self.fnptrs = {}        # (struct, field) -> (ret, [Param]): the function pointers of the structures
+
+
+def scan_headers(paths, api):
+    """What cparse.py does not keep of the headers (see Scan)."""
+    from cparse import clean_doc, evaluate, normalize_type, split_params
+    scan = Scan()
+    known = known_values(api)
+    defined = {n for n, _, _ in api.defines}
+    sources = []
+    for path in paths:
+        source = open(path, encoding="utf-8").read()
+        comments = []
+
+        def keep(match):
+            comments.append((match.start(), match.end(), match.group(0)))
+            return " " * (match.end() - match.start())
+
+        code = re.sub(r"/\*.*?\*/", keep, source, flags=re.S)
+        code = re.sub(r"//[^\n]*", lambda m: " " * len(m.group(0)), code)
+        code = code.replace("\\\n", "  ")
+        sources.append((code, comments))
+
+        for match in re.finditer(r"typedef\s+enum\s+\w*\s*\{(.*?)\}\s*(\w+)\s*;", code, flags=re.S):
+            value = -1
+            for entry in match.group(1).split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                if "=" in entry:
+                    item, expr = entry.split("=", 1)
+                    item = item.strip()
+                    value = evaluate(expr, known)
+                else:
+                    item = entry
+                    value += 1
+                known[item] = value
+                if item.endswith("_"):
+                    scan.marks.setdefault(match.group(2), []).append((item, value))
+
+        for match in re.finditer(r"typedef\s+struct\s+\w*\s*\{(.*?)\}\s*(\w+)\s*;", code, flags=re.S):
+            for field in re.finditer(r"([\w\s\*]+?)\(\s*\*\s*(\w+)\s*\)\s*\((.*?)\)\s*;", match.group(1), flags=re.S):
+                scan.fnptrs[(match.group(2), field.group(2))] = (normalize_type(field.group(1)), split_params(field.group(3)))
+
+    def doc_before(comments, code, position):
+        for start, end, text in reversed(comments):
+            if end <= position:
+                if code[end:position].strip() == "" and text.startswith("/**"):
+                    return clean_doc(text)
+                return ""
+        return ""
+
+    for code, comments in sources:
+        for match in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+(R_[A-Z0-9_]+|RAVEN_[A-Z0-9_]+)[ \t]+(.+)$", code, flags=re.M):
+            name = match.group(1)
+            if name in defined or name.endswith("_H") or name in ("RAVEN_API", "RAVEN_WEB_API"):
+                continue
+            try:
+                value = evaluate(match.group(2), known)
+            except (ValueError, SyntaxError, NameError):
+                continue
+            known[name] = value
+            defined.add(name)
+            scan.constants.append((name, value, doc_before(comments, code, match.start())))
+        for match in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+(R\w+)\(", code, flags=re.M):
+            scan.macros[match.group(1)] = doc_before(comments, code, match.start())
+    return scan
 
 
 # ---------------------------------------------------------------------------
 # The generator
 # ---------------------------------------------------------------------------
 
-def generate(api, module="raven"):
+def generate(api, module="raven", root=None):
     from cparse import classify
+
+    root = root or default_root()
+    scan = Scan()
+    if os.path.exists(os.path.join(root, "include", "Raven.h")):
+        api = full_api(api, root)
+        scan = scan_headers(header_paths(root), api)
+
+    unknown_macros = set(scan.macros) - set(C_MACROS)
+    if unknown_macros:
+        print("gen_c3: macros of the headers with no C3 version (C_MACROS): %s" % ", ".join(sorted(unknown_macros)),
+              file=sys.stderr)
+
+    def kind(ctype):
+        if ctype == "intptr_t":
+            return ("scalar", "intptr")
+        return classify(ctype, api)
 
     flag_enums = []
     for e in api.enums:
@@ -254,26 +466,26 @@ def generate(api, module="raven"):
             flags = flag_type(name, context)
             if flags:
                 return flags
-        kind, detail = classify(ctype, api)
-        if kind == "void":
+        k, detail = kind(ctype)
+        if k == "void":
             return "void"
-        if kind == "scalar":
-            return SCALAR[detail]
-        if kind in ("enum", "callback", "struct"):
+        if k == "scalar":
+            return "iptr" if detail == "intptr" else SCALAR[detail]
+        if k in ("enum", "callback", "struct"):
             return type_name(detail)
-        if kind in ("fnptr", "ptr", "cptr"):
+        if k in ("fnptr", "ptr", "cptr"):
             return "void*"
-        if kind in ("cstr", "owned_str"):
+        if k in ("cstr", "owned_str"):
             return "ZString"
-        if kind in ("cstr_out", "cstr_array"):
+        if k in ("cstr_out", "cstr_array"):
             return "ZString*"
-        if kind in ("bytes", "cbytes"):
+        if k in ("bytes", "cbytes"):
             return "char*"
-        if kind == "out":
+        if k == "out":
             return "%s*" % (SCALAR[detail[1]] if detail[0] == "scalar" else type_name(detail[1]))
-        if kind == "carray":
+        if k == "carray":
             return "%s*" % SCALAR[detail]
-        if kind in ("struct_ptr", "cstruct_ptr", "opaque_ptr"):
+        if k in ("struct_ptr", "cstruct_ptr", "opaque_ptr"):
             return "%s*" % type_name(detail)
         raise ValueError(ctype)
 
@@ -309,7 +521,7 @@ def generate(api, module="raven"):
         return name + "*" * stars
 
     def is_struct_value(ctype):
-        return classify(ctype, api)[0] == "struct"
+        return kind(ctype)[0] == "struct"
 
     def to_c(expr, c3t, ctype):
         """expr, of the C3 type c3t, as the C type of raven::c."""
@@ -326,6 +538,10 @@ def generate(api, module="raven"):
         if is_struct_value(ctype):
             return "bitcast(%s, %s)" % (expr, c3t)
         return "(%s)%s" % (c3t, expr)
+
+    def fnptr_alias(struct_name, field_name):
+        """The name of the function pointer type of a member: RAllocator.alloc -> RAllocatorAllocFn."""
+        return struct_name + pascal(snake_ident(field_name)) + "Fn"
 
     function_names = {f.name for f in api.functions}
 
@@ -356,30 +572,46 @@ def generate(api, module="raven"):
 
     # every name of a type must be one
     taken = {}
-    for kind, names in (("enum", [type_name(e.name) for e in api.enums]),
+    for what, names in (("enum", [type_name(e.name) for e in api.enums]),
                         ("struct", [type_name(s.name) for s in api.structs]),
                         ("opaque", [type_name(o) for o in api.opaque]),
                         ("callback", [type_name(c.name) for c in api.callbacks]),
                         ("handle", sorted(set(class_name.values()))),
-                        ("base", ["Id", "Error"])):
+                        ("base", ["Id", "Error", "Pixels"])):
         for name in names:
             if name in taken and not (name == "Error" and taken[name] == "enum"):
-                raise ValueError("the C3 type %s is both a %s and a %s" % (name, taken[name], kind))
-            taken[name] = kind
+                raise ValueError("the C3 type %s is both a %s and a %s" % (name, taken[name], what))
+            taken[name] = what
+
+    def struct_method(f):
+        """Rspring_kick(RSpring* spring, ...) is a method of Spring: (struct name, method name), or None."""
+        if not f.params:
+            return None
+        k, detail = kind(f.params[0].ctype)
+        if k not in ("struct_ptr", "cstruct_ptr"):
+            return None
+        stem = type_snake(type_name(detail)) + "_"
+        if snake(f.name).startswith(stem):
+            return detail, snake(f.name)[len(stem):]
+        return None
 
     by_class = {}
     free = []
     painter = []
+    struct_methods = []
     for f in api.functions:
         owner = class_of(f.name)
+        method = struct_method(f)
         if f.params and f.params[0].ctype == "RPainter*":
             painter.append(f)
+        elif method:
+            struct_methods.append((f, method[0], method[1]))
         elif owner:
             by_class.setdefault(owner[0], []).append((f, owner[1]))
         else:
             free.append(f)
 
-    unknown = (FALLIBLE_BOOL | FALLIBLE_ID | BOOL_RETURNS) - function_names
+    unknown = (FALLIBLE_BOOL | FALLIBLE_ID | BOOL_RETURNS | set(RETURN_CLASS)) - function_names
     if unknown:
         print("gen_c3: not in the headers any more: %s" % ", ".join(sorted(unknown)), file=sys.stderr)
 
@@ -399,8 +631,8 @@ def generate(api, module="raven"):
             return True
         if re.match(r"get_\w+able$", rest):        # get_selectable; not get_selected, an index
             return True
-        returns = re.search(r"@return([^@]*)", f.doc)
-        return bool(returns and re.search(r"R_TRUE|R_FALSE", returns.group(1)))
+        # "Returns R_TRUE when...", "R_FALSE when..." in the description (the @param lines left out)
+        return bool(re.search(r"\bR_(TRUE|FALSE)\b", "\n".join(doc_text(f.doc))))
 
     def returned_class(owner, rest, is_static):
         """The type of handle a function of `owner` returns, from its name."""
@@ -422,39 +654,47 @@ def generate(api, module="raven"):
             return class_name[item_class]
         return "Id"
 
-    # ---- raven::c: the C API as it is
+    # ======================================================================
+    # raven::c: the C API as it is
+    # ======================================================================
     ext = []
     x = ext.append
     x("// Raven for C3: the C API.")
     x("//")
     x("// Generated from the C headers by tools/bindgen/gen_c3.py (Raven %s): do not edit." % api.version)
     x("//")
-    x("// The C API of Raven as it is in the headers, for anything the module %s" % module)
+    x("// The C API of Raven as it is in the headers, 1:1, for anything the module %s" % module)
     x("// does not cover: its types (Rid, RWidgetType, RRect...), its constants")
-    x("// (R_INVALID_ID, R_WIDGET_BUTTON...) and its functions as `extern fn`, each")
-    x("// bound to the C function by @cname. The names are the ones of C, except where")
-    x("// C3 does not allow them: a function cannot start with a capital, so Rinit is")
-    x("// r_init and Rbutton_set_text is r_button_set_text; a parameter named like a")
-    x("// keyword of C3 takes a _ at its end. An enumeration of C is a CInt, a text a char*.")
+    x("// (R_INVALID_ID, R_WIDGET_BUTTON...), its macros, and its functions as")
+    x("// `extern fn`, each bound to the C function by @cname. The names are the ones")
+    x("// of C, in the snake_case C3 wants: a function cannot start with a capital, so")
+    x("// Rinit is r_init and Rbutton_set_text is r_button_set_text; a member or a")
+    x("// parameter named like a keyword of C3 takes a _ at its end. An enumeration of")
+    x("// C is a CInt, a text a char*.")
     x("//")
     x("//   import %s::c;" % module)
     x("//")
     x("//   if (!c::r_init(c::R_BACKEND_VULKAN)) return 1;")
-    x("//   Rid window = c::r_window_create(\"Hello\", 420, 220, c::R_WINDOW_DEFAULT);")
+    x("//   c::Rid window = c::r_window_create(\"Hello\", 420, 220, c::R_WINDOW_DEFAULT);")
     x("module %s::c;" % module)
+    x("")
+    x("import std::io;")
     x("")
     x("<* The handle of an object of the library: a window, a widget, a font... *>")
     x("alias Rid = uint;")
     x("<* An unsigned 32-bit integer: flags, colors. *>")
     x("alias Ruint = uint;")
     x("")
-    for name, kind, value in api.defines:
-        if kind == "str":
+    for name, k, value in api.defines:
+        if k == "str":
             x("const char* %s = \"%s\";" % (name, value))
-        elif kind == "id":
+        elif k == "id":
             x("const Rid %s = 0x%08X;" % (name, value))
         else:
             x("const CInt %s = %d;" % (name, value))
+    for name, value, doc in scan.constants:
+        ext.extend(doc_block(doc))
+        x("const CInt %s = %d;" % (name, value))
     x("")
     for e in api.enums:
         ext.extend(doc_block(e.doc))
@@ -462,35 +702,54 @@ def generate(api, module="raven"):
         for item, value, doc in e.items:
             ext.extend(doc_block(doc))
             x("const %s %s = %s;" % (e.name, item, "0x%04X" % value if value > 9 else str(value)))
+        for item, value in scan.marks.get(e.name, []):
+            x("const %s %s = %s;" % (e.name, item, "0x%04X" % value if value > 9 else str(value)))
         x("")
     for name in api.opaque:
         x("<* Only seen through a pointer. *>")
-        x("alias %s = void;" % name)
+        x("typedef %s = void;" % name)
         x("")
     for cb in api.callbacks:
         ext.extend(doc_block(cb.doc))
-        params = ", ".join("%s %s" % (c_type(p.ctype), safe(p.name)) for p in cb.params)
+        params = ", ".join("%s %s" % (c_type(p.ctype), ident(p.name)) for p in cb.params)
         x("alias %s = fn %s(%s);" % (cb.name, c_type(cb.ret), params))
     x("")
     for s in api.structs:
+        for field in s.fields:
+            if field.ctype == "fnptr" and (s.name, field.name) in scan.fnptrs:
+                ret, params = scan.fnptrs[(s.name, field.name)]
+                x("alias %s = fn %s(%s);" % (fnptr_alias(s.name, field.name), c_type(ret),
+                                             ", ".join("%s %s" % (c_type(p.ctype), ident(p.name)) for p in params)))
         ext.extend(doc_block(s.doc))
         x("struct %s" % s.name)
         x("{")
         for field in s.fields:
             ext.extend(doc_block(field.doc, "\t"))
-            t = c_type(field.ctype)
+            if field.ctype == "fnptr" and (s.name, field.name) in scan.fnptrs:
+                t = fnptr_alias(s.name, field.name)
+            else:
+                t = c_type(field.ctype)
             if field.array:
                 t = "%s[%d]" % (t, field.array)
-            x("\t%s %s;" % (t, safe(field.name)))
+            x("\t%s %s;" % (t, ident(field.name)))
         x("}")
         x("")
     for f in api.functions:
         ext.extend(doc_block(f.doc))
-        params = ", ".join("%s %s" % (c_type(p.ctype), safe(p.name)) for p in f.params)
+        params = ", ".join("%s %s" % (c_type(p.ctype), ident(p.name)) for p in f.params)
         x("extern fn %s %s(%s) @cname(\"%s\");" % (c_type(f.ret), c_function(f.name), params, f.name))
         x("")
+    for name in sorted(scan.macros):
+        if name not in C_MACROS:
+            continue
+        doc = scan.macros[name].replace("Requires <stdio.h>.", "")
+        ext.extend(doc_block(doc))
+        ext.extend(C_MACROS[name])
+        x("")
 
-    # ---- the module
+    # ======================================================================
+    # raven: the C3 API
+    # ======================================================================
     out = []
     w = out.append
     version = ".".join(str(v) for n, k, v in api.defines if n in ("RAVEN_VERSION_MAJOR", "RAVEN_VERSION_MINOR", "RAVEN_VERSION_PATCH")) or api.version
@@ -516,6 +775,13 @@ def generate(api, module="raven"):
     w("//     fail returns an Optional, with the fault of Rerror_get_last (or")
     w("//     ERROR_FAILED when nothing was recorded); check() returns the last error;")
     w("//   - what answers yes or no returns a bool, and takes a bool for R_TRUE;")
+    w("//   - a pointer and its count are a slice: plot.set_series_data(0, xs, ys);")
+    w("//   - what C fills through pointers is returned: window.get_size() is a")
+    w("//     CInt[<2>], window.get_frame_stats() a FrameStats;")
+    w("//   - functions of a structure are its methods: spring.kick(2.0);")
+    w("//   - memory of Raven is released the C3 way: file_read() copies the file")
+    w("//     with an Allocator (mem by default), window.capture() returns Pixels,")
+    w("//     released with pixels.free() (defer pixels.free(););")
     w("//   - Painter is what a paint callback draws with: painter.rect(...).")
     w("//")
     w("//   import %s;" % module)
@@ -540,17 +806,24 @@ def generate(api, module="raven"):
     w("<* A handle of the library: a window, a widget, a font... INVALID_ID names nothing. *>")
     w("typedef Id = uint;")
     w("")
-    for name, kind, value in api.defines:
-        if kind == "str":
+    for name, k, value in api.defines:
+        if k == "str":
             w("const ZString %s = \"%s\";" % (constant_name(name), value))
-        elif kind == "id":
+        elif k == "id":
             w("const Id %s = (Id)0x%08X;" % (constant_name(name), value))
         else:
             w("const CInt %s = %d;" % (constant_name(name), value))
+    for name, value, doc in scan.constants:
+        out.extend(doc_block(doc))
+        w("const CInt %s = %d;" % (constant_name(name), value))
     w("")
     w("<* Whether the handle names something (is not INVALID_ID). *>")
     w("fn bool Id.is_valid(self) @inline => self != INVALID_ID;")
     w("")
+    if "R_ID_INDEX" in scan.macros:
+        out.extend(doc_block(scan.macros["R_ID_INDEX"]))
+        w("fn uint Id.index(self) @inline => c::r_id_index((c::Rid)self);")
+        w("")
 
     # ---- errors
     error_enum = api.enum("RError")
@@ -560,7 +833,7 @@ def generate(api, module="raven"):
                   for item, _, _ in error_enum.items if item != "R_NO_ERROR"]
         w("<* The errors of Raven (Error) as faults, and ERROR_FAILED for a failure without one. *>")
         w("excuse")
-        for i, (item, fault) in enumerate(faults):
+        for item, fault in faults:
             w("\t%s," % fault)
         w("\tERROR_FAILED;")
         w("")
@@ -584,7 +857,7 @@ def generate(api, module="raven"):
         w("")
         w("<*")
         w(" Returns the last error recorded (and clears it) as a fault: raven::check()!;")
-        w(" Nothing when no error was recorded.")
+        w(" Nothing when no error was recorded. The C3 form of the macro Rerror_check.")
         w("*>")
         w("fn void? check()")
         w("{")
@@ -616,60 +889,202 @@ def generate(api, module="raven"):
         w("")
     for cb in api.callbacks:
         out.extend(doc_block(cb.doc))
-        params = ", ".join("%s %s" % (c3_type(p.ctype), safe(p.name)) for p in cb.params)
+        params = ", ".join("%s %s" % (c3_type(p.ctype), ident(p.name)) for p in cb.params)
         w("alias %s = fn %s(%s);" % (type_name(cb.name), c3_type(cb.ret), params))
     w("")
     for s in api.structs:
+        for field in s.fields:
+            if field.ctype == "fnptr" and (s.name, field.name) in scan.fnptrs:
+                ret, params = scan.fnptrs[(s.name, field.name)]
+                w("alias %s = fn %s(%s);" % (
+                    fnptr_alias(type_name(s.name), field.name), c3_type(ret),
+                    ", ".join("%s %s" % (c3_type(p.ctype, p.name, s.name), ident(p.name)) for p in params)))
         out.extend(doc_block(s.doc))
         w("struct %s" % type_name(s.name))
         w("{")
         for field in s.fields:
             out.extend(doc_block(field.doc, "\t"))
-            t = "void*" if field.ctype == "fnptr" else c3_type(field.ctype, field.name, s.name)
+            if field.ctype == "fnptr":
+                t = fnptr_alias(type_name(s.name), field.name) if (s.name, field.name) in scan.fnptrs else "void*"
+            else:
+                t = c3_type(field.ctype, field.name, s.name)
             if field.array:
                 t = "%s[%d]" % (t, field.array)
-            w("\t%s %s;" % (t, safe(field.name)))
+            w("\t%s %s;" % (t, ident(field.name)))
         w("}")
         w("")
 
     # ---- functions
-    def wrapper(f, name, owner=None, rest=None, receiver=None):
-        """A function (or a method of `receiver`) calling f; None when an alias does."""
+    def wrapper(f, name, owner=None, rest=None, receiver=None, by_pointer=False):
+        """
+        A function (or a method of `receiver`, `&self` when by_pointer) calling
+        f; None when an alias does.
+        """
         rest = rest if rest is not None else snake(f.name)
         is_method = receiver is not None
         params = f.params[1:] if is_method else f.params
-        own = {safe(p.name) for p in params}
-        result_var = "result"
-        while result_var in own:
-            result_var += "_"
+        kinds = [kind(p.ctype) for p in params]
+        names = [ident(p.name) for p in params]
+        n = len(params)
+
+        # ---- what C fills through pointers, returned instead (hidden parameters)
+        mode = None
+        hidden = set()
+        out_names = [p.name for p in params]
+        if (f.ret == "uint8_t*" and n >= 2 and out_names[-2:] == ["width", "height"]
+                and all(k == ("out", ("scalar", "int")) for k in kinds[-2:])):
+            mode = "pixels"                                     # Rwindow_capture, Rimage_decode
+            hidden = {n - 2, n - 1}
+        elif kinds and kind(f.ret)[0] == "owned_str" and kinds[-1] == ("out", ("scalar", "size_t")):
+            mode = "owned_bytes"                                # Rfile_read
+            hidden = {n - 1}
+        elif kind(f.ret)[0] == "cstr_array" and n == 1 and kinds[0][0] == "out" and out_names[0] == "count":
+            mode = "string_slice"                               # Rvulkan_get_required_*_extensions
+            hidden = {0}
+        elif kinds and kinds[-1][0] == "struct_ptr" and f.ret in ("void", "int"):
+            mode = "struct_out"                                 # Rmemory_get_stats, Rwindow_get_native_handle
+            hidden = {n - 1}
+        elif (f.ret == "void" and 2 <= n <= 4 and all(k[0] == "out" and k[1][0] == "scalar" for k in kinds)
+              and len(set(kinds)) == 1 and kinds[0][1][1] in ("int", "float", "double")):
+            mode = "vector"                                     # Rwindow_get_size, Rwidget_get_rect
+            hidden = set(range(n))
+
+        # ---- slices: the pointers before a count
+        slice_of = {}       # index of a pointer -> type of its elements
+        group_last = {}     # index of a pointer -> index of the last pointer of its group
+        length_of = {}      # index of a count -> index of the pointer whose length it is
+        for i, p in enumerate(params):
+            if i == 0 or i in hidden or kinds[i][0] != "scalar" or not LENGTH_PARAM.match(p.name):
+                continue
+            group = []
+            j = i - 1
+            while j >= 0 and kinds[j][0] in ARRAY_KINDS and j not in slice_of and j not in hidden:
+                group.insert(0, j)
+                j -= 1
+            if not group and kinds[i - 1][0] == "cstr" and p.ctype == "size_t":
+                group = [i - 1]                                 # Rxml_document_parse(xml, size, ...)
+            for g in group:
+                k, detail = kinds[g]
+                slice_of[g] = {"carray": SCALAR.get(detail, "char"), "cbytes": "char", "cptr": "char",
+                               "cstr_array": "ZString", "cstruct_ptr": type_name(detail) if detail else "char",
+                               "cstr": "char"}[k]
+                group_last[g] = group[-1]
+            if group:
+                length_of[i] = group[-1]
+
+        used = set(names) | {"self"}
+
+        def local(base):
+            name_ = base
+            while name_ in used:
+                name_ += "_"
+            used.add(name_)
+            return name_
+
         signature = []
         args = []
+        prelude = []
+        hidden_locals = {}
         converted = False
         if is_method:
-            self_type = "Painter*" if receiver == "Painter" else receiver
+            self_type = receiver + "*" if by_pointer else receiver
             args.append(to_c("self", self_type, f.params[0].ctype))
-        for p in params:
+        for i, p in enumerate(params):
+            pname = names[i]
+            if i in hidden:
+                k, detail = kinds[i]
+                if k == "struct_ptr":
+                    t = type_name(detail)
+                elif detail[0] == "scalar":
+                    t = SCALAR[detail[1]]
+                else:
+                    t = type_name(detail[1])
+                hidden_locals[i] = (pname, t)
+                prelude.append("\t%s %s;" % (t, pname))
+                args.append(to_c("&" + pname, t + "*", p.ctype))
+                converted = True
+                continue
+            if i in length_of:
+                args.append(to_c("%s.len" % names[length_of[i]], "usz", p.ctype))
+                converted = True
+                continue
+            if i in slice_of:
+                element = slice_of[i]
+                t = "String" if kinds[i][0] == "cstr" else element + "[]"
+                arg = to_c(pname + ".ptr", element + "*", p.ctype)
+                if group_last[i] != i:
+                    arg = "(%s.len ? %s : null)" % (pname, arg)    # Rplot_set_series_data: x NULL is 0, 1, 2...
+                args.append(arg)
+                signature.append("%s %s" % (t, pname))
+                converted = True
+                continue
             t = c3_type(p.ctype, p.name, f.name)
             if p.ctype == "int" and p.name in BOOL_PARAMS:
                 t = "bool"
-            arg = to_c(safe(p.name), t, p.ctype)
-            converted = converted or arg != safe(p.name)
+            arg = to_c(pname, t, p.ctype)
+            converted = converted or arg != pname
             args.append(arg)
-            signature.append("%s %s" % (t, safe(p.name)))
+            signature.append("%s %s" % (t, pname))
         call = "c::%s(%s)" % (c_function(f.name), ", ".join(args))
 
         fallible = is_fallible(f)
         ret = ret_type(f)
         body = None
+        extra_doc = None
         if f.ret == "Rid" and owner:
             ret = returned_class(owner, rest, not is_method)
-        if fallible and f.ret == "int":
+        if f.name in RETURN_CLASS:
+            ret = RETURN_CLASS[f.name]
+
+        if mode == "pixels":
+            (wname, _), (hname, _) = hidden_locals[n - 2], hidden_locals[n - 1]
+            pixels = local("pixels")
+            ret = "Pixels?"
+            body = prelude + [
+                "\tchar* %s = %s;" % (pixels, call),
+                "\tif (!%s) return last_fault()~;" % pixels,
+                "\treturn { .data = %s, .width = %s, .height = %s };" % (pixels, wname, hname)]
+            extra_doc = "Release the pixels with Pixels.free()."
+        elif mode == "owned_bytes":
+            size = hidden_locals[n - 1][0]
+            data = local("data")
+            allocator = local("allocator")
+            signature.append("Allocator %s = mem" % allocator)
+            ret = "char[]?"
+            body = prelude + [
+                "\tchar* %s = %s;" % (data, call),
+                "\tif (!%s) return last_fault()~;" % data,
+                "\tdefer c::r_memory_free(%s);" % data,
+                "\treturn alloc::clone_slice(%s, %s[:%s]);" % (allocator, data, size)]
+            extra_doc = "The bytes are a copy made with `allocator`: free them with it."
+        elif mode == "string_slice":
+            count = hidden_locals[0][0]
+            ret = "ZString[]"
+            body = prelude + ["\treturn ((ZString*)%s)[:%s];" % (call, count)]
+            extra_doc = "The texts belong to the library."
+        elif mode == "struct_out":
+            value, t = hidden_locals[n - 1]
+            if f.ret == "int":
+                ret = t + "?"
+                body = prelude + ["\tif (!%s) return last_fault()~;" % call, "\treturn %s;" % value]
+            else:
+                ret = t
+                body = prelude + ["\t%s;" % call, "\treturn %s;" % value]
+        elif mode == "vector":
+            element = hidden_locals[0][1]
+            ret = "%s[<%d>]" % (element, n)
+            body = prelude + ["\t%s;" % call,
+                              "\treturn { %s };" % ", ".join(hidden_locals[i][0] for i in range(n))]
+            extra_doc = "Returned as { %s }." % ", ".join(hidden_locals[i][0] for i in range(n))
+        elif fallible and f.ret == "int":
             ret = "void?"
-            body = ["	if (!%s) return last_fault()~;" % call]
+            body = prelude + ["\tif (!%s) return last_fault()~;" % call]
         elif fallible:
-            body = ["	Id %s = (Id)%s;" % (result_var, call),
-                    "	if (%s == INVALID_ID) return last_fault()~;" % result_var,
-                    "	return %s;" % (result_var if ret == "Id" else "(%s)%s" % (ret, result_var))]
+            result_var = local("result")
+            body = prelude + [
+                "\tId %s = (Id)%s;" % (result_var, call),
+                "\tif (%s == INVALID_ID) return last_fault()~;" % result_var,
+                "\treturn %s;" % (result_var if ret == "Id" else "(%s)%s" % (ret, result_var))]
             ret += "?"
         elif returns_bool(f, rest):
             ret = "bool"
@@ -680,18 +1095,50 @@ def generate(api, module="raven"):
                 return None
             call = returned
 
-        if receiver == "Painter":
-            head = "fn %s Painter.%s(&self%s)" % (ret, name, "".join(", " + s for s in signature))
+        if by_pointer:
+            head = "fn %s %s.%s(&self%s)" % (ret, receiver, name, "".join(", " + s for s in signature))
         elif is_method:
             head = "fn %s %s.%s(self%s)" % (ret, receiver, name, "".join(", " + s for s in signature))
         else:
             head = "fn %s %s(%s)" % (ret, name, ", ".join(signature))
-        lines = doc_block(f.doc)
+        lines = doc_block(f.doc, extra=extra_doc)
         if body:
             lines += [head, "{"] + body + ["}"]
         else:
             lines.append("%s @inline => %s;" % (head, call))
         return lines
+
+    # ---- what Raven allocates for the application
+    if any(f.ret == "uint8_t*" for f in api.functions) and "Rpixels_free" in function_names:
+        w("<*")
+        w(" Pixels made by Raven (Window.capture, image_decode): `width` x `height`")
+        w(" tightly packed RGBA8 pixels. Release them with free(): defer pixels.free();")
+        w("*>")
+        w("struct Pixels")
+        w("{")
+        w("\tchar* data;")
+        w("\tCInt width;")
+        w("\tCInt height;")
+        w("}")
+        w("")
+        w("<* The bytes of the pixels: width * height * 4 of them. *>")
+        w("fn char[] Pixels.bytes(&self) @inline => self.data[:(usz)self.width * (usz)self.height * 4];")
+        w("")
+        w("<* Releases the pixels (Rpixels_free). *>")
+        w("fn void Pixels.free(&self)")
+        w("{")
+        w("\tif (self.data) c::r_pixels_free(self.data);")
+        w("\t*self = {};")
+        w("}")
+        w("")
+
+    # ---- functions of the structures, as their methods: spring.kick(2.0)
+    if struct_methods:
+        w("// ---- methods of the structures")
+        w("")
+        for f, sname, rest in struct_methods:
+            out.extend(wrapper(f, safe(rest), None, rest, type_name(sname), by_pointer=True))
+            w("")
 
     def emit_class(prefix, base):
         name = class_name[prefix]
@@ -743,7 +1190,7 @@ def generate(api, module="raven"):
     for f in painter:
         name = re.sub(r"^Rdraw_", "", f.name)
         name = safe(snake(f.name) if name == f.name else name)
-        out.extend(wrapper(f, name, None, name, "Painter"))
+        out.extend(wrapper(f, name, None, name, "Painter", by_pointer=True))
         w("")
 
     # ---- the rest
@@ -756,8 +1203,9 @@ def generate(api, module="raven"):
         out.extend(lines)
         w("")
 
+    generate.counts = (len(api.functions), len(api.enums), len(api.structs), len(api.callbacks))
     return {"c3/raven.c3l/src/raven.c3": "\n".join(out).rstrip() + "\n",
-            "c3/raven.c3l/src/raven_c.c3": "\n".join(ext) + "\n"}
+            "c3/raven.c3l/src/raven_c.c3": "\n".join(ext).rstrip() + "\n"}
 
 
 # ---------------------------------------------------------------------------
@@ -791,7 +1239,7 @@ def main():
         sys.path.insert(0, bindgen)
         import cparse
         api = cparse.parse(os.path.join(root, "include"))
-        files = generate(api, args.module)
+        files = generate(api, args.module, os.path.abspath(root))
     finally:
         if clone:
             shutil.rmtree(clone, ignore_errors=True)
@@ -811,8 +1259,7 @@ def main():
         print("out of date (run tools/bindgen/gen_c3.py): " + ", ".join(stale))
         return 1
     print("%d functions, %d enums, %d structures, %d callbacks -> %s%s" % (
-        len(api.functions), len(api.enums), len(api.structs), len(api.callbacks), args.out,
-        "" if args.check else " (%d written)" % len(stale)))
+        generate.counts + (args.out, "" if args.check else " (%d written)" % len(stale))))
     return 0
 
 

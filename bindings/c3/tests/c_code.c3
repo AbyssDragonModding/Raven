@@ -67,6 +67,11 @@ fn int main(String[] args)
 	c::r_window_inject_mouse_button(window, c::R_MOUSE_LEFT, c::R_TRUE);
 	c::r_window_inject_mouse_button(window, c::R_MOUSE_LEFT, c::R_FALSE);
 	ok &= expect(!c::r_is_running(), "the Quit button");
+	// the macros of the headers: R_ID_INDEX and Rerror_check (prints nothing: no error is pending)
+	ok &= expect(c::r_id_index(window) == (window & 0xFFFFF), "r_id_index");
+	c::r_error_check();
+	// constants computed from the end marks of the enumerations
+	ok &= expect(c::R_COLOR_COUNT == c::R_COLOR_LAST_ - c::R_COLOR_WINDOW, "R_COLOR_COUNT");
 	CInt code = c::r_get_exit_code();
 	c::r_shutdown();
 	if (!ok) return 1;
