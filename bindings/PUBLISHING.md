@@ -99,8 +99,10 @@ gpg --keyserver keys.openpgp.org --send-keys <the id of the key>
   `bindings/go` is named `raven` (and the projects of the designer
   `import "raven/raven"`), so it is used through a `replace` directive, as
   the designer does: `replace raven => <Raven>/bindings/go`.
-- **Zig**: the package manager of Zig fetches whole repositories; use
-  `zig/raven.zig` from a release, or `@cImport(@cInclude("Raven.h"))`.
+- **Zig**: `zig/` is a package (`build.zig.zon`) to use as a path dependency
+  (`.path = "<Raven>/bindings/zig"`); the package manager of Zig fetches whole
+  repositories, whose root has no `build.zig.zon`. `zig/raven.zig` alone, from
+  a release, or `@cImport(@cInclude("Raven.h"))` also work.
 - **Odin**: Odin has no registry and no package manager, by the choice of its
   authors: a package is a folder. Copy `odin/raven/` into the project, or
   point a collection at `bindings/odin` (`-collection:ext=<Raven>/bindings/odin`).

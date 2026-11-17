@@ -23,7 +23,9 @@
 //       r.Rquit(0);
 //   }
 //
-// In build.zig: exe.linkSystemLibrary("raven"); exe.linkLibC();
+// The package of this folder (build.zig, Zig 0.17) gives this file as the module
+// raven_c, and the idiomatic API over it (src/raven.zig) as the module raven:
+// see README.md. Without it: exe.linkSystemLibrary("raven"); exe.linkLibC();
 // (Zig can also read the C header itself: @cImport(@cInclude("Raven.h")).)
 
 pub const Rid = u32;

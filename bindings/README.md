@@ -13,7 +13,7 @@ under the same names, with the same documentation comments.
 | Rust | `rust/` | A crate: `raven::sys` is the C API, plus `text`, `cstr`, `action_bind` and a few `&str` helpers. | yes (`binding_rust`) |
 | Go | `go/` | A cgo package: 417 functions with Go types, and `ActionBind`, `ErrorSetCallback`, `TimerStart` for callbacks. | yes (`binding_go`) |
 | C# | `csharp/Raven.cs` | P/Invoke declarations: `Raven.R.Rwindow_create(...)`, delegates, structures. | yes (tested on Windows, macOS and Linux) |
-| Zig | `zig/raven.zig` | `extern` declarations and `extern struct`s. | yes (tested on Windows, macOS and Linux) |
+| Zig | `zig/` | A package (`build.zig`, `build.zig.zon`, Zig 0.17) with two modules: `raven`, the idiomatic API (typed handles with methods, error unions, optionals, slices, allocators, Zig callbacks with a typed context), and `raven_c` (`zig/raven.zig`), the `extern` declarations and `extern struct`s. See `zig/README.md`. | yes (`binding_zig`, `binding_zig_wrapper`, `binding_zig_wrapper_test`) |
 | LuaJIT | `luajit/raven.lua` | The declarations for the FFI of LuaJIT. | yes (tested on Windows, macOS and Linux) |
 | Java | `java/` | One class, `raven.R`, over the Foreign Function & Memory API (Java 22+): no dependency, no JNI. Texts are `String`, callbacks are lambdas, structures are classes with an accessor per field. | yes (`binding_java`) |
 | Odin | `odin/raven/raven.odin`, `odin/raven_odin/` | A package of `foreign` declarations; structures have the layout of C. `raven_odin` is an optional layer over it: Odin strings, booleans and enums, callbacks without `proc "c"`. See `odin/README.md`. | yes (`binding_odin`, `binding_odin_wrapper`, `binding_odin_wrapper_test`) |
@@ -130,12 +130,21 @@ cgo, or use actions.
 
 Add `Raven.cs` to the project and put the library beside the program.
 
-**Zig**
+**Zig** (0.17)
 
-    const r = @import("raven.zig");
-    // build.zig: exe.linkSystemLibrary("raven"); exe.linkLibC();
+    // build.zig.zon: .raven = .{ .path = "<raven>/bindings/zig" }
+    // build.zig:     const raven = b.dependency("raven", .{ .target = target, .optimize = optimize, .@"lib-dir" = "<lib>" });
+    //                exe.root_module.addImport("raven", raven.module("raven"));
+    const raven = @import("raven");
 
-Zig can also read the C header itself: `@cImport(@cInclude("Raven.h"))`.
+    try raven.init(.vulkan);
+    const window = try raven.Window.createFromXml(xml);
+
+`raven.c` (the module `raven_c`) is the C API as it is. See `zig/README.md`;
+`zig build test` in `zig/` runs the headless tests and the example. The file
+`zig/raven.zig` alone still works without the package
+(`exe.linkSystemLibrary("raven"); exe.linkLibC();`), and Zig can also read the
+C header itself: `@cImport(@cInclude("Raven.h"))`.
 
 **LuaJIT**
 

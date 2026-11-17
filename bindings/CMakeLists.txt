@@ -16,6 +16,8 @@
 #   binding_d             needs dub and a D compiler, and the shared library; not on Windows
 #   binding_nim           needs nim and the shared library; not on Windows
 #   binding_zig           needs zig: compiles every declaration of zig/raven.zig (nothing is linked or run)
+#   binding_zig_wrapper   needs zig 0.17: `zig build check` of zig/, every declaration of the idiomatic layer
+#   binding_zig_wrapper_test   the same and the shared library: `zig build test` (headless tests and example)
 #
 # C# and LuaJIT have no test here.
 
@@ -31,6 +33,22 @@ if(RAVEN_ZIG)
 		COMMAND ${RAVEN_ZIG} test ${CMAKE_CURRENT_SOURCE_DIR}/zig/check.zig --test-no-exec
 			--cache-dir ${CMAKE_CURRENT_BINARY_DIR}/zig-cache
 		WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+	# the idiomatic layer (zig/src) and its package (zig/build.zig) need Zig 0.17
+	execute_process(COMMAND ${RAVEN_ZIG} version OUTPUT_VARIABLE RAVEN_ZIG_VERSION
+		OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+	if(RAVEN_ZIG_VERSION VERSION_GREATER_EQUAL 0.17)
+		set(RAVEN_ZIG_BUILD ${RAVEN_ZIG} build --cache-dir ${CMAKE_CURRENT_BINARY_DIR}/zig-cache
+			--prefix ${CMAKE_CURRENT_BINARY_DIR}/zig-out)
+		add_test(NAME binding_zig_wrapper
+			COMMAND ${RAVEN_ZIG_BUILD} check
+			WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/zig)
+		# build.zig puts the folder of the DLL on the PATH: this one runs on Windows too
+		if(RAVEN_BUILD_SHARED)
+			add_test(NAME binding_zig_wrapper_test
+				COMMAND ${RAVEN_ZIG_BUILD} test "-Dlib-dir=$<TARGET_LINKER_FILE_DIR:raven>" "-Dbin-dir=$<TARGET_FILE_DIR:raven>"
+				WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/zig)
+		endif()
+	endif()
 endif()
 
 include(CheckLanguage)

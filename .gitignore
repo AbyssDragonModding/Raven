@@ -13,10 +13,12 @@ out/
 dev/
 *.patch
 
-# build outputs of the bindings (.NET, Cargo)
+# build outputs of the bindings (.NET, Cargo, Zig)
 bindings/**/bin/
 bindings/**/obj/
 target/
+.zig-cache/
+zig-out/
 
 # Browser integration test dependencies
 tests/web/node_modules/
