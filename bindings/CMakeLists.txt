@@ -235,3 +235,6 @@ if(RAVEN_BUILD_SHARED AND WIN32)
 			WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 	endif()
 endif()
+
+# the idiomatic Zig layer (branch zig-wrapper)
+include(${CMAKE_CURRENT_SOURCE_DIR}/zig/tests.cmake OPTIONAL)

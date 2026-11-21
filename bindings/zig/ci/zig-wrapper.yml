@@ -1,0 +1,64 @@
+# The idiomatic Zig layer follows Raven by itself: whenever main changes (a
+# "Sync fork", a push of the updates of Raven), main is merged into the branch
+# zig-wrapper, the Zig API is written again from the new headers
+# (tools/bindgen/gen_zig_wrapper.py), checked to compile (`zig build check`),
+# committed and pushed. Also every day, and by hand (Actions > Zig wrapper >
+# Run workflow).
+#
+# It runs tools/bindgen/update_zig_wrapper.py of the branch zig-wrapper, which
+# does the same from a clone. When the merge conflicts or the new API does not
+# compile, the run fails and the branch is left as it was.
+#
+# GitHub starts the workflows of a push to main and of a schedule from the
+# default branch only: this file is kept here, on zig-wrapper, and installed
+# on main as .github/workflows/zig-wrapper.yml (see bindings/zig/README.md).
+#
+# When an update of Raven changes its own workflows (.github/workflows), GitHub
+# refuses the push of the merge with the token of the run: give the repository
+# a secret ZIG_WRAPPER_TOKEN, a personal access token with Contents and
+# Workflows read and write on this repository (Settings > Secrets and
+# variables > Actions). Without it, the token of the run is used.
+
+name: Zig wrapper
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: zig-wrapper
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zig-wrapper
+          fetch-depth: 0
+          token: ${{ secrets.ZIG_WRAPPER_TOKEN || github.token }}
+
+      - name: Zig 0.17.1
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/zig.tar.xz" https://ziglang.org/download/0.17.1/zig-x86_64-linux-0.17.1.tar.xz
+          echo "3581863e3cbcfd0fce0efc682ce7e9e93da96668a977791d356a26d2a7e9b17a  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-0.17.1" >> "$GITHUB_PATH"
+
+      - name: Merge main, regenerate, check, push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          zig version
+          python3 tools/bindgen/update_zig_wrapper.py --remote origin --main main --branch zig-wrapper
+
+      - name: What keeps the types of C
+        if: always()
+        run: cat bindings/zig/FALLBACKS.md >> "$GITHUB_STEP_SUMMARY" || true
