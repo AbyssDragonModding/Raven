@@ -1,7 +1,7 @@
 .{
     // The Zig bindings of Raven: `raven` (the idiomatic API) and `raven_c` (the C API).
     .name = .raven,
-    .version = "0.2.3",
+    .version = "0.3.0",
     .fingerprint = 0x2456138b779c8288, // Changing this has security and trust implications.
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},
